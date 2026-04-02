@@ -1,0 +1,42 @@
+{
+  "name": "dc-editor-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "DC Editor Backend API - Node.js + Express",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node server/index.js",
+    "worker": "node server/worker/executionWorker.js",
+    "health:check": "node scripts/health-check.mjs"
+  },
+  "keywords": [
+    "code-execution",
+    "api",
+    "express",
+    "nodejs"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@clerk/backend": "^2.32.1",
+    "@clerk/express": "^1.7.74",
+    "bcryptjs": "^3.0.3",
+    "bullmq": "^5.58.0",
+    "cloudinary": "^2.9.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "express-rate-limit": "^7.5.1",
+    "helmet": "^8.1.0",
+    "ioredis": "^5.8.0",
+    "jsonwebtoken": "^9.0.3",
+    "jszip": "^3.10.1",
+    "livekit-server-sdk": "^2.15.0",
+    "pg": "^8.18.0",
+    "socket.io": "^4.8.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
