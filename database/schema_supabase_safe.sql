@@ -1,4 +1,5 @@
 -- Live Collaborative Code Editor - Production Schema (v2.1)
+-- Safe Supabase deployment variant (non-destructive, idempotent)
 -- Normalized relational design for scalability
 -- PostgreSQL schema for Supabase or any managed Postgres instance
 -- Run this file in Supabase SQL Editor or with psql against your DATABASE_URL.
@@ -9,35 +10,13 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- ========================================
 -- DROP EXISTING TABLES (if migrating from v1.0)
 -- ========================================
-DROP TABLE IF EXISTS collab_project_settings CASCADE;
-DROP TABLE IF EXISTS collab_user_settings CASCADE;
-DROP TABLE IF EXISTS collab_activity_feed CASCADE;
-DROP TABLE IF EXISTS collab_audit_log CASCADE;
-DROP TABLE IF EXISTS collab_terminal_sessions CASCADE;
-DROP TABLE IF EXISTS collab_execution_jobs CASCADE;
-DROP TABLE IF EXISTS collab_chat_reactions CASCADE;
-DROP TABLE IF EXISTS collab_chat_messages CASCADE;
-DROP TABLE IF EXISTS collab_ai_messages CASCADE;
-DROP TABLE IF EXISTS collab_ai_conversations CASCADE;
-DROP TABLE IF EXISTS collab_cursors CASCADE;
-DROP TABLE IF EXISTS collab_file_locks CASCADE;
-DROP TABLE IF EXISTS collab_file_versions CASCADE;
-DROP TABLE IF EXISTS collab_file_content CASCADE;
-DROP TABLE IF EXISTS collab_files CASCADE;
-DROP TABLE IF EXISTS collab_folders CASCADE;
-DROP TABLE IF EXISTS collab_invites CASCADE;
-DROP TABLE IF EXISTS collab_project_members CASCADE;
-DROP TABLE IF EXISTS collab_project_files CASCADE;
-DROP TABLE IF EXISTS collab_projects CASCADE;
-DROP TABLE IF EXISTS collab_roles CASCADE;
-DROP TABLE IF EXISTS collab_users CASCADE;
 
 -- ========================================
 -- CORE USER MANAGEMENT TABLES
 -- ========================================
 BEGIN;
 
-CREATE TABLE collab_users (
+CREATE TABLE IF NOT EXISTS collab_users (
   id TEXT PRIMARY KEY,
   clerk_id TEXT UNIQUE NOT NULL,
   email TEXT UNIQUE NOT NULL,
@@ -58,14 +37,14 @@ CREATE TABLE collab_users (
   last_active_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_collab_users_clerk_id ON collab_users (clerk_id);
-CREATE INDEX idx_collab_users_email ON collab_users (email);
-CREATE INDEX idx_collab_users_last_active ON collab_users (last_active_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_users_clerk_id ON collab_users (clerk_id);
+CREATE INDEX IF NOT EXISTS idx_collab_users_email ON collab_users (email);
+CREATE INDEX IF NOT EXISTS idx_collab_users_last_active ON collab_users (last_active_at DESC);
 
 -- ========================================
 -- PROJECT CORE TABLES
 -- ========================================
-CREATE TABLE collab_projects (
+CREATE TABLE IF NOT EXISTS collab_projects (
   id TEXT PRIMARY KEY,
   owner_id TEXT NOT NULL REFERENCES collab_users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
@@ -78,14 +57,14 @@ CREATE TABLE collab_projects (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_collab_projects_owner ON collab_projects (owner_id);
-CREATE INDEX idx_collab_projects_archived ON collab_projects (is_archived) WHERE NOT is_archived;
-CREATE INDEX idx_collab_projects_created ON collab_projects (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_projects_owner ON collab_projects (owner_id);
+CREATE INDEX IF NOT EXISTS idx_collab_projects_archived ON collab_projects (is_archived) WHERE NOT is_archived;
+CREATE INDEX IF NOT EXISTS idx_collab_projects_created ON collab_projects (created_at DESC);
 
 -- ========================================
 -- PERMISSION & ROLE TABLES
 -- ========================================
-CREATE TABLE collab_roles (
+CREATE TABLE IF NOT EXISTS collab_roles (
   id TEXT PRIMARY KEY,
   name TEXT UNIQUE NOT NULL, -- admin, editor, viewer, commenter
   description TEXT,
@@ -101,10 +80,18 @@ INSERT INTO collab_roles (id, name, description, can_edit, can_delete, can_share
   ('admin', 'Admin', 'Full control', true, true, true, true, true),
   ('editor', 'Editor', 'Can edit and execute', true, true, false, false, true),
   ('viewer', 'Viewer', 'Read-only access', false, false, false, false, false),
-  ('commenter', 'Commenter', 'Can view and comment', false, false, false, false, false);
+  ('commenter', 'Commenter', 'Can view and comment', false, false, false, false, false)
+ON CONFLICT (id) DO UPDATE SET
+  name = EXCLUDED.name,
+  description = EXCLUDED.description,
+  can_edit = EXCLUDED.can_edit,
+  can_delete = EXCLUDED.can_delete,
+  can_share = EXCLUDED.can_share,
+  can_invite = EXCLUDED.can_invite,
+  can_execute = EXCLUDED.can_execute;
 
 -- Member management with roles
-CREATE TABLE collab_project_members (
+CREATE TABLE IF NOT EXISTS collab_project_members (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES collab_projects(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL REFERENCES collab_users(id) ON DELETE CASCADE,
@@ -114,14 +101,14 @@ CREATE TABLE collab_project_members (
   UNIQUE (project_id, user_id)
 );
 
-CREATE INDEX idx_collab_project_members_project ON collab_project_members (project_id);
-CREATE INDEX idx_collab_project_members_user ON collab_project_members (user_id);
-CREATE INDEX idx_collab_project_members_role ON collab_project_members (role_id);
+CREATE INDEX IF NOT EXISTS idx_collab_project_members_project ON collab_project_members (project_id);
+CREATE INDEX IF NOT EXISTS idx_collab_project_members_user ON collab_project_members (user_id);
+CREATE INDEX IF NOT EXISTS idx_collab_project_members_role ON collab_project_members (role_id);
 
 -- ========================================
 -- FILE STRUCTURE TABLES
 -- ========================================
-CREATE TABLE collab_folders (
+CREATE TABLE IF NOT EXISTS collab_folders (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES collab_projects(id) ON DELETE CASCADE,
   parent_folder_id TEXT REFERENCES collab_folders(id) ON DELETE CASCADE,
@@ -133,11 +120,11 @@ CREATE TABLE collab_folders (
   UNIQUE (project_id, folder_path)
 );
 
-CREATE INDEX idx_collab_folders_project ON collab_folders (project_id);
-CREATE INDEX idx_collab_folders_parent ON collab_folders (parent_folder_id);
-CREATE INDEX idx_collab_folders_path ON collab_folders (folder_path);
+CREATE INDEX IF NOT EXISTS idx_collab_folders_project ON collab_folders (project_id);
+CREATE INDEX IF NOT EXISTS idx_collab_folders_parent ON collab_folders (parent_folder_id);
+CREATE INDEX IF NOT EXISTS idx_collab_folders_path ON collab_folders (folder_path);
 
-CREATE TABLE collab_files (
+CREATE TABLE IF NOT EXISTS collab_files (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES collab_projects(id) ON DELETE CASCADE,
   folder_id TEXT REFERENCES collab_folders(id) ON DELETE SET NULL,
@@ -151,15 +138,15 @@ CREATE TABLE collab_files (
   UNIQUE (project_id, file_path)
 );
 
-CREATE INDEX idx_collab_files_project ON collab_files (project_id);
-CREATE INDEX idx_collab_files_folder ON collab_files (folder_id);
-CREATE INDEX idx_collab_files_language ON collab_files (language);
-CREATE INDEX idx_collab_files_created ON collab_files (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_files_project ON collab_files (project_id);
+CREATE INDEX IF NOT EXISTS idx_collab_files_folder ON collab_files (folder_id);
+CREATE INDEX IF NOT EXISTS idx_collab_files_language ON collab_files (language);
+CREATE INDEX IF NOT EXISTS idx_collab_files_created ON collab_files (created_at DESC);
 
 -- ========================================
 -- FILE CONTENT & VERSIONING TABLES
 -- ========================================
-CREATE TABLE collab_file_content (
+CREATE TABLE IF NOT EXISTS collab_file_content (
   id TEXT PRIMARY KEY,
   file_id TEXT NOT NULL REFERENCES collab_files(id) ON DELETE CASCADE UNIQUE,
   content TEXT NOT NULL,
@@ -168,10 +155,10 @@ CREATE TABLE collab_file_content (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_collab_file_content_file ON collab_file_content (file_id);
+CREATE INDEX IF NOT EXISTS idx_collab_file_content_file ON collab_file_content (file_id);
 
 -- File versioning for history tracking
-CREATE TABLE collab_file_versions (
+CREATE TABLE IF NOT EXISTS collab_file_versions (
   id TEXT PRIMARY KEY,
   file_id TEXT NOT NULL REFERENCES collab_files(id) ON DELETE CASCADE,
   version_number INTEGER NOT NULL,
@@ -185,11 +172,11 @@ CREATE TABLE collab_file_versions (
   UNIQUE (file_id, version_number)
 );
 
-CREATE INDEX idx_collab_file_versions_file ON collab_file_versions (file_id, version_number DESC);
-CREATE INDEX idx_collab_file_versions_changed ON collab_file_versions (changed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_file_versions_file ON collab_file_versions (file_id, version_number DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_file_versions_changed ON collab_file_versions (changed_at DESC);
 
 -- File locking for concurrent edit prevention
-CREATE TABLE collab_file_locks (
+CREATE TABLE IF NOT EXISTS collab_file_locks (
   id TEXT PRIMARY KEY,
   file_id TEXT NOT NULL REFERENCES collab_files(id) ON DELETE CASCADE,
   locked_by TEXT NOT NULL REFERENCES collab_users(id) ON DELETE CASCADE,
@@ -198,13 +185,13 @@ CREATE TABLE collab_file_locks (
   UNIQUE (file_id)
 );
 
-CREATE INDEX idx_collab_file_locks_expires ON collab_file_locks (expires_at);
-CREATE INDEX idx_collab_file_locks_user ON collab_file_locks (locked_by);
+CREATE INDEX IF NOT EXISTS idx_collab_file_locks_expires ON collab_file_locks (expires_at);
+CREATE INDEX IF NOT EXISTS idx_collab_file_locks_user ON collab_file_locks (locked_by);
 
 -- ========================================
 -- REAL-TIME COLLABORATION TABLES
 -- ========================================
-CREATE TABLE collab_cursors (
+CREATE TABLE IF NOT EXISTS collab_cursors (
   id TEXT PRIMARY KEY,
   file_id TEXT NOT NULL REFERENCES collab_files(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL REFERENCES collab_users(id) ON DELETE CASCADE,
@@ -214,14 +201,14 @@ CREATE TABLE collab_cursors (
   UNIQUE (file_id, user_id)
 );
 
-CREATE INDEX idx_collab_cursors_file ON collab_cursors (file_id);
-CREATE INDEX idx_collab_cursors_user ON collab_cursors (user_id);
-CREATE INDEX idx_collab_cursors_updated ON collab_cursors (updated_at);
+CREATE INDEX IF NOT EXISTS idx_collab_cursors_file ON collab_cursors (file_id);
+CREATE INDEX IF NOT EXISTS idx_collab_cursors_user ON collab_cursors (user_id);
+CREATE INDEX IF NOT EXISTS idx_collab_cursors_updated ON collab_cursors (updated_at);
 
 -- ========================================
 -- CHAT & MESSAGING TABLES
 -- ========================================
-CREATE TABLE collab_chat_messages (
+CREATE TABLE IF NOT EXISTS collab_chat_messages (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES collab_projects(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL REFERENCES collab_users(id) ON DELETE CASCADE,
@@ -232,11 +219,11 @@ CREATE TABLE collab_chat_messages (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_collab_chat_messages_project ON collab_chat_messages (project_id, created_at DESC);
-CREATE INDEX idx_collab_chat_messages_user ON collab_chat_messages (user_id);
-CREATE INDEX idx_collab_chat_messages_file ON collab_chat_messages (file_id);
+CREATE INDEX IF NOT EXISTS idx_collab_chat_messages_project ON collab_chat_messages (project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_chat_messages_user ON collab_chat_messages (user_id);
+CREATE INDEX IF NOT EXISTS idx_collab_chat_messages_file ON collab_chat_messages (file_id);
 
-CREATE TABLE collab_chat_reactions (
+CREATE TABLE IF NOT EXISTS collab_chat_reactions (
   id TEXT PRIMARY KEY,
   message_id TEXT NOT NULL REFERENCES collab_chat_messages(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL REFERENCES collab_users(id) ON DELETE CASCADE,
@@ -245,13 +232,13 @@ CREATE TABLE collab_chat_reactions (
   UNIQUE (message_id, user_id, emoji)
 );
 
-CREATE INDEX idx_collab_chat_reactions_message ON collab_chat_reactions (message_id);
-CREATE INDEX idx_collab_chat_reactions_user ON collab_chat_reactions (user_id);
+CREATE INDEX IF NOT EXISTS idx_collab_chat_reactions_message ON collab_chat_reactions (message_id);
+CREATE INDEX IF NOT EXISTS idx_collab_chat_reactions_user ON collab_chat_reactions (user_id);
 
 -- ========================================
 -- AI ASSISTANT TABLES
 -- ========================================
-CREATE TABLE collab_ai_conversations (
+CREATE TABLE IF NOT EXISTS collab_ai_conversations (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES collab_projects(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL REFERENCES collab_users(id) ON DELETE CASCADE,
@@ -260,10 +247,10 @@ CREATE TABLE collab_ai_conversations (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_collab_ai_conversations_project_user
+CREATE INDEX IF NOT EXISTS idx_collab_ai_conversations_project_user
   ON collab_ai_conversations (project_id, user_id, updated_at DESC);
 
-CREATE TABLE collab_ai_messages (
+CREATE TABLE IF NOT EXISTS collab_ai_messages (
   id TEXT PRIMARY KEY,
   conversation_id TEXT NOT NULL REFERENCES collab_ai_conversations(id) ON DELETE CASCADE,
   project_id TEXT NOT NULL REFERENCES collab_projects(id) ON DELETE CASCADE,
@@ -274,13 +261,13 @@ CREATE TABLE collab_ai_messages (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_collab_ai_messages_conversation_created
+CREATE INDEX IF NOT EXISTS idx_collab_ai_messages_conversation_created
   ON collab_ai_messages (conversation_id, created_at ASC);
 
 -- ========================================
 -- EXECUTION & TERMINAL TABLES
 -- ========================================
-CREATE TABLE collab_execution_jobs (
+CREATE TABLE IF NOT EXISTS collab_execution_jobs (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES collab_users(id) ON DELETE CASCADE,
   project_id TEXT NOT NULL REFERENCES collab_projects(id) ON DELETE CASCADE,
@@ -298,12 +285,12 @@ CREATE TABLE collab_execution_jobs (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_collab_execution_jobs_project ON collab_execution_jobs (project_id, queued_at DESC);
-CREATE INDEX idx_collab_execution_jobs_user ON collab_execution_jobs (user_id, queued_at DESC);
-CREATE INDEX idx_collab_execution_jobs_status ON collab_execution_jobs (status) WHERE status != 'completed';
-CREATE INDEX idx_collab_execution_jobs_created ON collab_execution_jobs (queued_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_execution_jobs_project ON collab_execution_jobs (project_id, queued_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_execution_jobs_user ON collab_execution_jobs (user_id, queued_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_execution_jobs_status ON collab_execution_jobs (status) WHERE status != 'completed';
+CREATE INDEX IF NOT EXISTS idx_collab_execution_jobs_created ON collab_execution_jobs (queued_at DESC);
 
-CREATE TABLE collab_terminal_sessions (
+CREATE TABLE IF NOT EXISTS collab_terminal_sessions (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES collab_projects(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL REFERENCES collab_users(id) ON DELETE CASCADE,
@@ -315,14 +302,14 @@ CREATE TABLE collab_terminal_sessions (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_collab_terminal_sessions_project ON collab_terminal_sessions (project_id);
-CREATE INDEX idx_collab_terminal_sessions_user ON collab_terminal_sessions (user_id);
-CREATE INDEX idx_collab_terminal_sessions_active ON collab_terminal_sessions (is_active) WHERE is_active;
+CREATE INDEX IF NOT EXISTS idx_collab_terminal_sessions_project ON collab_terminal_sessions (project_id);
+CREATE INDEX IF NOT EXISTS idx_collab_terminal_sessions_user ON collab_terminal_sessions (user_id);
+CREATE INDEX IF NOT EXISTS idx_collab_terminal_sessions_active ON collab_terminal_sessions (is_active) WHERE is_active;
 
 -- ========================================
 -- INVITATION & SHARING TABLES
 -- ========================================
-CREATE TABLE collab_invites (
+CREATE TABLE IF NOT EXISTS collab_invites (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES collab_projects(id) ON DELETE CASCADE,
   invite_code TEXT UNIQUE NOT NULL,
@@ -336,14 +323,14 @@ CREATE TABLE collab_invites (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_collab_invites_project ON collab_invites (project_id);
-CREATE INDEX idx_collab_invites_code ON collab_invites (invite_code);
-CREATE INDEX idx_collab_invites_expires ON collab_invites (expires_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_invites_project ON collab_invites (project_id);
+CREATE INDEX IF NOT EXISTS idx_collab_invites_code ON collab_invites (invite_code);
+CREATE INDEX IF NOT EXISTS idx_collab_invites_expires ON collab_invites (expires_at DESC);
 
 -- ========================================
 -- AUDIT & ACTIVITY TABLES
 -- ========================================
-CREATE TABLE collab_audit_log (
+CREATE TABLE IF NOT EXISTS collab_audit_log (
   id TEXT PRIMARY KEY,
   project_id TEXT REFERENCES collab_projects(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL REFERENCES collab_users(id) ON DELETE SET NULL,
@@ -354,13 +341,13 @@ CREATE TABLE collab_audit_log (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_collab_audit_log_project ON collab_audit_log (project_id, created_at DESC);
-CREATE INDEX idx_collab_audit_log_user ON collab_audit_log (user_id, created_at DESC);
-CREATE INDEX idx_collab_audit_log_action ON collab_audit_log (action_type);
-CREATE INDEX idx_collab_audit_log_created ON collab_audit_log (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_audit_log_project ON collab_audit_log (project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_audit_log_user ON collab_audit_log (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_audit_log_action ON collab_audit_log (action_type);
+CREATE INDEX IF NOT EXISTS idx_collab_audit_log_created ON collab_audit_log (created_at DESC);
 
 -- Activity feed for social features
-CREATE TABLE collab_activity_feed (
+CREATE TABLE IF NOT EXISTS collab_activity_feed (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES collab_projects(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL REFERENCES collab_users(id) ON DELETE CASCADE,
@@ -369,14 +356,14 @@ CREATE TABLE collab_activity_feed (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_collab_activity_feed_project ON collab_activity_feed (project_id, created_at DESC);
-CREATE INDEX idx_collab_activity_feed_user ON collab_activity_feed (user_id, created_at DESC);
-CREATE INDEX idx_collab_activity_feed_created ON collab_activity_feed (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_activity_feed_project ON collab_activity_feed (project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_activity_feed_user ON collab_activity_feed (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collab_activity_feed_created ON collab_activity_feed (created_at DESC);
 
 -- ========================================
 -- USER PREFERENCES TABLE
 -- ========================================
-CREATE TABLE collab_user_settings (
+CREATE TABLE IF NOT EXISTS collab_user_settings (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES collab_users(id) ON DELETE CASCADE UNIQUE,
   theme TEXT DEFAULT 'dark', -- dark, light, auto
@@ -392,12 +379,12 @@ CREATE TABLE collab_user_settings (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_collab_user_settings_user ON collab_user_settings (user_id);
+CREATE INDEX IF NOT EXISTS idx_collab_user_settings_user ON collab_user_settings (user_id);
 
 -- ========================================
 -- PROJECT SETTINGS TABLE
 -- ========================================
-CREATE TABLE collab_project_settings (
+CREATE TABLE IF NOT EXISTS collab_project_settings (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES collab_projects(id) ON DELETE CASCADE UNIQUE,
   default_runtime TEXT NOT NULL DEFAULT 'nodejs',
@@ -413,6 +400,6 @@ CREATE TABLE collab_project_settings (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_collab_project_settings_project ON collab_project_settings (project_id);
+CREATE INDEX IF NOT EXISTS idx_collab_project_settings_project ON collab_project_settings (project_id);
 
 COMMIT;

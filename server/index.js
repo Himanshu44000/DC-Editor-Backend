@@ -22,6 +22,9 @@ import { configureCloudinary, isCloudinaryConfigured } from './storage/cloudinar
 import * as fileStorage from './storage/fileStorage.js'
 
 dotenv.config()
+if (String(process.env.DATABASE_URL || '').includes('pooler.supabase.com')) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+}
 configureCloudinary()
 
 process.on('unhandledRejection', (reason) => {
@@ -134,6 +137,8 @@ const API_RATE_LIMIT_WINDOW_MS = Math.max(1000, Number(process.env.API_RATE_LIMI
 const API_RATE_LIMIT_MAX = Math.max(10, Number(process.env.API_RATE_LIMIT_MAX || 240))
 const AI_RATE_LIMIT_WINDOW_MS = Math.max(1000, Number(process.env.AI_RATE_LIMIT_WINDOW_MS || 60000))
 const AI_RATE_LIMIT_MAX = Math.max(5, Number(process.env.AI_RATE_LIMIT_MAX || 40))
+
+const createPgClient = () => new Client({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
 const AI_SYSTEM_INSTRUCTION = [
   'You are an AI coding assistant inside a collaborative web IDE.',
   'Prioritize practical, accurate, and secure guidance.',
@@ -2131,22 +2136,48 @@ const runCode = async (runtime, sourceCode, stdinInput = '') => {
     }
   }
 
-  // Native execution fallback
+  // Native execution fallback - save source to temp file and pass stdin separately
   if (runtime === 'javascript') {
-    return runProcess({
-      command: 'node',
-      args: ['--input-type=module', '-'],
-      input: sourceCode,
-      timeoutMs: EXECUTION_TIMEOUT_MS,
-    })
+    const fs = await import('fs')
+    ensureDsaRuntimeTempRoot()
+    const tempFile = path.join(DSA_RUNTIME_TMP_ROOT, `temp_${Date.now()}.js`)
+    fs.writeFileSync(tempFile, sourceCode)
+    try {
+      return await runProcess({
+        command: 'node',
+        args: ['--input-type=module', tempFile],
+        input: stdinInput,
+        timeoutMs: EXECUTION_TIMEOUT_MS,
+      })
+    } finally {
+      try { fs.unlinkSync(tempFile) } catch (e) { void e }
+    }
   }
 
   if (runtime === 'python') {
-    const pythonResult = await runProcess({ command: 'python', args: ['-'], input: sourceCode, timeoutMs: EXECUTION_TIMEOUT_MS })
-    if (pythonResult.stderr.includes('not recognized') || pythonResult.stderr.includes('ENOENT')) {
-      return runProcess({ command: 'py', args: ['-3', '-'], input: sourceCode, timeoutMs: EXECUTION_TIMEOUT_MS })
+    const fs = await import('fs')
+    ensureDsaRuntimeTempRoot()
+    const tempFile = path.join(DSA_RUNTIME_TMP_ROOT, `temp_${Date.now()}.py`)
+    fs.writeFileSync(tempFile, sourceCode)
+    try {
+      let pythonResult = await runProcess({
+        command: 'python',
+        args: [tempFile],
+        input: stdinInput,
+        timeoutMs: EXECUTION_TIMEOUT_MS,
+      })
+      if (pythonResult.stderr.includes('not recognized') || pythonResult.stderr.includes('ENOENT')) {
+        pythonResult = await runProcess({
+          command: 'py',
+          args: ['-3', tempFile],
+          input: stdinInput,
+          timeoutMs: EXECUTION_TIMEOUT_MS,
+        })
+      }
+      return pythonResult
+    } finally {
+      try { fs.unlinkSync(tempFile) } catch (e) { void e }
     }
-    return pythonResult
   }
 
   if (runtime === 'cpp') {
@@ -3605,7 +3636,7 @@ const persistProject = async (project) => {
 
   // Use an isolated client for this transaction so concurrent requests cannot
   // interleave statements into the same transaction context.
-  const transactionClient = new Client({ connectionString: DATABASE_URL })
+  const transactionClient = createPgClient()
   await transactionClient.connect()
 
   await transactionClient.query('BEGIN')
@@ -4129,7 +4160,7 @@ const initDb = async () => {
     return
   }
 
-  dbClient = new Client({ connectionString: DATABASE_URL })
+  dbClient = createPgClient()
   await dbClient.connect()
 
   await dbClient.query('ALTER TABLE collab_users ADD COLUMN IF NOT EXISTS avatar_url TEXT')

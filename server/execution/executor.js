@@ -139,13 +139,36 @@ const runDockerCode = async (runtime, sourceCode, stdinInput = '') => {
   }
 }
 
-const runNativeCode = async (runtime, sourceCode) => {
+const runNativeCode = async (runtime, sourceCode, stdin = '') => {
+  // Native execution - save source to temp file and pass stdin separately
   if (runtime === 'javascript') {
-    return runProcess({ command: 'node', args: ['--input-type=module', '-'], input: sourceCode })
+    ensureDsaRuntimeTempRoot()
+    const tempFile = path.join(DSA_RUNTIME_TMP_ROOT, `temp_${Date.now()}.js`)
+    fs.writeFileSync(tempFile, sourceCode)
+    try {
+      return await runProcess({
+        command: 'node',
+        args: ['--input-type=module', tempFile],
+        input: stdin,
+      })
+    } finally {
+      try { fs.unlinkSync(tempFile) } catch (e) { void e }
+    }
   }
 
   if (runtime === 'python') {
-    return runProcess({ command: 'python', args: ['-'], input: sourceCode })
+    ensureDsaRuntimeTempRoot()
+    const tempFile = path.join(DSA_RUNTIME_TMP_ROOT, `temp_${Date.now()}.py`)
+    fs.writeFileSync(tempFile, sourceCode)
+    try {
+      return await runProcess({
+        command: 'python',
+        args: [tempFile],
+        input: stdin,
+      })
+    } finally {
+      try { fs.unlinkSync(tempFile) } catch (e) { void e }
+    }
   }
 
   return {
@@ -166,5 +189,5 @@ export const executeCode = async ({ runtime, sourceCode, stdin = '', useDocker =
     return runDockerCode(runtime, sourceCode, stdin)
   }
 
-  return runNativeCode(runtime, sourceCode)
+  return runNativeCode(runtime, sourceCode, stdin)
 }

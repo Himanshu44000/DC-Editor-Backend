@@ -7,6 +7,9 @@ import { createRedisConnection } from '../queue/redis.js'
 import { executeCode } from '../execution/executor.js'
 
 dotenv.config()
+if (String(process.env.DATABASE_URL || '').includes('pooler.supabase.com')) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+}
 
 const DATABASE_URL = process.env.DATABASE_URL
 const USE_DOCKER = process.env.USE_DOCKER === 'true'
@@ -15,7 +18,7 @@ if (!DATABASE_URL) {
   throw new Error('DATABASE_URL is required for execution worker')
 }
 
-const dbClient = new Client({ connectionString: DATABASE_URL })
+const dbClient = new Client({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
 await dbClient.connect()
 const redisConnection = createRedisConnection()
 
