@@ -55,22 +55,59 @@ process.on('rejectionHandled', () => {})
 
 const app = express()
 
+const normalizeOrigin = (value = '') => String(value || '').trim().replace(/\/+$/, '')
+
 const parseAllowedOrigins = (value = '') =>
   String(value || '')
     .split(',')
-    .map((entry) => String(entry || '').trim())
+    .map((entry) => normalizeOrigin(entry))
     .filter(Boolean)
 
 const CORS_ALLOWED_ORIGINS = parseAllowedOrigins(
-  process.env.CORS_ALLOWED_ORIGINS || process.env.FRONTEND_BASE_URL || 'http://localhost:5173',
+  process.env.CORS_ALLOWED_ORIGINS ||
+    process.env.FRONTEND_BASE_URL ||
+    process.env.FRONTEND_URL ||
+    'http://localhost:5173',
 )
 
 const isOriginAllowed = (origin = '') => {
-  const normalized = String(origin || '').trim()
+  const normalized = normalizeOrigin(origin)
   if (!normalized) return true
   if (!CORS_ALLOWED_ORIGINS.length) return false
   if (CORS_ALLOWED_ORIGINS.includes('*')) return true
-  return CORS_ALLOWED_ORIGINS.includes(normalized)
+
+  if (CORS_ALLOWED_ORIGINS.includes(normalized)) return true
+
+  // Support wildcard host entries like https://*.vercel.app
+  let originUrl
+  try {
+    originUrl = new URL(normalized)
+  } catch {
+    return false
+  }
+
+  return CORS_ALLOWED_ORIGINS.some((allowedOrigin) => {
+    if (!allowedOrigin.includes('*')) return false
+
+    let allowedUrl
+    try {
+      allowedUrl = new URL(allowedOrigin.replace('*.', 'placeholder.'))
+    } catch {
+      return false
+    }
+
+    if (allowedUrl.protocol !== originUrl.protocol) return false
+
+    const allowedHostPattern = allowedOrigin
+      .replace(/^https?:\/\//, '')
+      .replace(/:\d+$/, '')
+
+    if (!allowedHostPattern.startsWith('*.')) return false
+
+    const baseHost = allowedHostPattern.slice(2)
+    const originHost = originUrl.hostname
+    return originHost === baseHost || originHost.endsWith(`.${baseHost}`)
+  })
 }
 
 const httpServer = createServer(app)
@@ -81,7 +118,7 @@ const io = new Server(httpServer, {
         callback(null, true)
         return
       }
-      callback(new Error('Not allowed by CORS'))
+      callback(null, false)
     },
     credentials: true,
   },
@@ -225,7 +262,7 @@ app.use(
         callback(null, true)
         return
       }
-      callback(new Error('Not allowed by CORS'))
+      callback(null, false)
     },
     credentials: true,
   }),
