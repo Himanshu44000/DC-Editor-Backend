@@ -22,7 +22,7 @@ function normalizeEnvSecret(value) {
   return trimmed;
 }
 
-export function configureCloudinary() {
+export function configureCloudinary({ quiet = false } = {}) {
   if (isConfigured) return;
 
   const CLOUDINARY_CLOUD_NAME = normalizeEnvSecret(process.env.CLOUDINARY_CLOUD_NAME);
@@ -30,8 +30,10 @@ export function configureCloudinary() {
   const CLOUDINARY_API_SECRET = normalizeEnvSecret(process.env.CLOUDINARY_API_SECRET);
 
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
-    console.warn('⚠️  Cloudinary not configured - file storage will use in-memory fallback');
-    console.warn('   Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET in .env');
+    if (!quiet) {
+      console.warn('Cloudinary not configured - file storage will use in-memory fallback');
+      console.warn('Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET in .env');
+    }
     return;
   }
 
@@ -43,7 +45,9 @@ export function configureCloudinary() {
   });
 
   isConfigured = true;
-  console.log('✅ Cloudinary configured:', CLOUDINARY_CLOUD_NAME);
+  if (!quiet) {
+    console.log('Cloudinary configured:', CLOUDINARY_CLOUD_NAME);
+  }
 }
 
 export function getCloudinary() {

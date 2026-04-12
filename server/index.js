@@ -21,11 +21,9 @@ import { isRedisConfigured } from './queue/redis.js'
 import { configureCloudinary, isCloudinaryConfigured } from './storage/cloudinaryClient.js'
 import * as fileStorage from './storage/fileStorage.js'
 
-dotenv.config()
-if (String(process.env.DATABASE_URL || '').includes('pooler.supabase.com')) {
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
-}
-configureCloudinary()
+dotenv.config({ quiet: true })
+const QUIET_STARTUP_LOGS = String(process.env.QUIET_STARTUP_LOGS || 'true').trim().toLowerCase() !== 'false'
+configureCloudinary({ quiet: QUIET_STARTUP_LOGS })
 
 process.on('unhandledRejection', (reason) => {
   const nestedError = reason?.error
@@ -127,6 +125,7 @@ const io = new Server(httpServer, {
 const PORT = process.env.PORT || 4000
 const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCase()
 const IS_PRODUCTION = NODE_ENV === 'production'
+const STARTUP_VERBOSE = String(process.env.STARTUP_VERBOSE || '').trim().toLowerCase() === 'true'
 const TRUST_PROXY = String(process.env.TRUST_PROXY || '').trim().toLowerCase() === 'true'
 const FORCE_HTTPS = String(process.env.FORCE_HTTPS || '').trim().toLowerCase() === 'true'
 const CLERK_SECRET_KEY = String(process.env.CLERK_SECRET_KEY || '').trim()
@@ -174,8 +173,29 @@ const API_RATE_LIMIT_WINDOW_MS = Math.max(1000, Number(process.env.API_RATE_LIMI
 const API_RATE_LIMIT_MAX = Math.max(10, Number(process.env.API_RATE_LIMIT_MAX || 240))
 const AI_RATE_LIMIT_WINDOW_MS = Math.max(1000, Number(process.env.AI_RATE_LIMIT_WINDOW_MS || 60000))
 const AI_RATE_LIMIT_MAX = Math.max(5, Number(process.env.AI_RATE_LIMIT_MAX || 40))
+const DATABASE_SSL_REJECT_UNAUTHORIZED = String(process.env.DATABASE_SSL_REJECT_UNAUTHORIZED || 'false').trim().toLowerCase() !== 'false'
+const PORT_FALLBACK_ATTEMPTS = Math.max(0, Number(process.env.PORT_FALLBACK_ATTEMPTS || 20))
 
-const createPgClient = () => new Client({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
+const normalizeDatabaseUrl = (value = '') => {
+  const normalized = String(value || '').trim()
+  if (!normalized) return ''
+
+  // Avoid pg warning noise from sslmode URI aliases and rely on explicit ssl options instead.
+  try {
+    const parsed = new URL(normalized)
+    parsed.searchParams.delete('sslmode')
+    parsed.searchParams.delete('uselibpqcompat')
+    return parsed.toString()
+  } catch {
+    return normalized
+  }
+}
+
+const createPgClient = () =>
+  new Client({
+    connectionString: normalizeDatabaseUrl(DATABASE_URL),
+    ssl: { rejectUnauthorized: DATABASE_SSL_REJECT_UNAUTHORIZED },
+  })
 const AI_SYSTEM_INSTRUCTION = [
   'You are an AI coding assistant inside a collaborative web IDE.',
   'Prioritize practical, accurate, and secure guidance.',
@@ -8922,30 +8942,50 @@ const start = async () => {
     }
 
     await initDb()
-    if (dbClient) {
-      console.log('PostgreSQL persistence enabled')
-    } else {
-      console.log(`Local file persistence enabled at ${LOCAL_STATE_PATH} (set DATABASE_URL for PostgreSQL)`) 
-    }
-
-    if (USE_EXECUTION_QUEUE) {
-      console.log('Execution queue mode enabled (BullMQ + Redis). Start worker: npm run dev:worker')
-    } else {
-      console.log('Execution queue mode disabled (inline execution mode)')
-    }
-
-    httpServer.on('error', (error) => {
-      if (error?.code === 'EADDRINUSE') {
-        console.error(`Port ${PORT} is already in use. Stop the existing server process or change PORT in .env.`)
-        process.exit(1)
+    if (STARTUP_VERBOSE) {
+      if (dbClient) {
+        console.log('PostgreSQL persistence enabled')
+      } else {
+        console.log(`Local file persistence enabled at ${LOCAL_STATE_PATH} (set DATABASE_URL for PostgreSQL)`)
       }
-      console.error('HTTP server failed to start:', error)
-      process.exit(1)
-    })
 
-    httpServer.listen(PORT, () => {
-      console.log(`Collab server running on http://localhost:${PORT}`)
-    })
+      if (USE_EXECUTION_QUEUE) {
+        console.log('Execution queue mode enabled (BullMQ + Redis). Start worker: npm run dev:worker')
+      } else {
+        console.log('Execution queue mode disabled (inline execution mode)')
+      }
+    }
+
+    const basePort = Number(PORT)
+    const initialPort = Number.isInteger(basePort) && basePort > 0 ? basePort : 4000
+
+    const listenWithFallback = (requestedPort, remainingRetries) =>
+      new Promise((resolve, reject) => {
+        const onError = (error) => {
+          httpServer.off('listening', onListening)
+          if (error?.code === 'EADDRINUSE' && remainingRetries > 0) {
+            const nextPort = requestedPort + 1
+            if (STARTUP_VERBOSE || !QUIET_STARTUP_LOGS) {
+              console.warn(`Port ${requestedPort} is busy, retrying on ${nextPort}...`)
+            }
+            resolve(listenWithFallback(nextPort, remainingRetries - 1))
+            return
+          }
+          reject(error)
+        }
+
+        const onListening = () => {
+          httpServer.off('error', onError)
+          resolve(requestedPort)
+        }
+
+        httpServer.once('error', onError)
+        httpServer.once('listening', onListening)
+        httpServer.listen(requestedPort)
+      })
+
+    const activePort = await listenWithFallback(initialPort, PORT_FALLBACK_ATTEMPTS)
+    console.log(`Running on http://localhost:${activePort}`)
   } catch (error) {
     console.error('Server startup failed:', error)
     process.exit(1)
