@@ -2875,6 +2875,16 @@ const ensureFastApiRouteWiring = (project) => {
 
 const terminalSessionKey = (ownerUserId, projectId, terminalId) => `${ownerUserId}:${projectId}:${terminalId}`
 const userRoom = (userId) => `user:${userId}`
+const LOCAL_PREVIEW_URL_REGEX = /https?:\/\/(?:localhost|127\.0\.0\.1):(\d{2,5})(?:[/?#][^\s]*)?/i
+
+const detectLocalPreviewPort = (text = '') => {
+  const source = String(text || '')
+  const match = source.match(LOCAL_PREVIEW_URL_REGEX)
+  if (!match?.[1]) return null
+  const parsed = Number(match[1])
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) return null
+  return parsed
+}
 
 const getProjectTerminalWorkspace = (projectId, userId) => {
   const key = `${String(projectId || '')}:${String(userId || '')}`
@@ -3349,6 +3359,14 @@ const getCdCompletionSuggestions = (project, session, rawInput) => {
   return entries
     .filter((name) => name.toLowerCase().startsWith(lowerPrefix))
     .map((name) => `cd ${basePart}${name}`)
+}
+
+const resolveTerminalPreviewSession = (project, userId, terminalId = 'terminal-1') => {
+  const normalizedTerminalId = String(terminalId || 'terminal-1')
+  const terminalOwnerUserId = project.sharedTerminalEnabled ? project.ownerId : userId
+  const sessionKey = terminalSessionKey(terminalOwnerUserId, project.id, normalizedTerminalId)
+  const session = terminalSessions.get(sessionKey)
+  return { session, normalizedTerminalId }
 }
 
 const serializeProjectForDb = (project) => ({
@@ -6749,6 +6767,66 @@ app.get('/api/projects/:projectId/voice/participants', authMiddleware, async (re
   }
 })
 
+const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requestedPath = '') => {
+  const { project, error } = assertProjectMembership(projectId, req.userId)
+  if (error) {
+    return res.status(error.status).json({ message: error.message })
+  }
+
+  const { session } = resolveTerminalPreviewSession(project, req.userId, terminalId)
+  if (!session || !session.previewPort) {
+    return res.status(404).json({ message: 'No active preview server found for this terminal.' })
+  }
+
+  const normalizedPath = String(requestedPath || '').replace(/^\/+/, '')
+  const base = `http://127.0.0.1:${session.previewPort}`
+  const targetUrl = new URL(normalizedPath ? `/${normalizedPath}` : '/', base)
+
+  const originalUrl = String(req.originalUrl || '')
+  const queryIndex = originalUrl.indexOf('?')
+  if (queryIndex >= 0) {
+    targetUrl.search = originalUrl.slice(queryIndex)
+  }
+
+  try {
+    const upstream = await fetch(targetUrl, {
+      method: 'GET',
+      headers: {
+        Accept: String(req.headers.accept || '*/*'),
+        'User-Agent': String(req.headers['user-agent'] || 'dc-editor-preview-proxy'),
+      },
+      redirect: 'manual',
+    })
+
+    for (const [headerName, headerValue] of upstream.headers.entries()) {
+      const normalizedHeader = String(headerName || '').toLowerCase()
+      if (normalizedHeader === 'connection') continue
+      if (normalizedHeader === 'transfer-encoding') continue
+      if (normalizedHeader === 'content-encoding') continue
+      res.setHeader(headerName, headerValue)
+    }
+
+    const payload = Buffer.from(await upstream.arrayBuffer())
+    return res.status(upstream.status).send(payload)
+  } catch (proxyError) {
+    return res.status(502).json({
+      message: 'Preview server is not reachable. Start your app again in terminal and retry.',
+      details: String(proxyError?.message || 'unknown_error'),
+    })
+  }
+}
+
+app.get('/api/projects/:projectId/terminal-preview/:terminalId', authMiddleware, async (req, res) => {
+  return proxyTerminalPreviewRequest(req, res, req.params.projectId, req.params.terminalId, '')
+})
+
+app.get(/^\/api\/projects\/([^/]+)\/terminal-preview\/([^/]+)\/(.+)$/, authMiddleware, async (req, res) => {
+  const projectId = String(req.params?.[0] || '')
+  const terminalId = String(req.params?.[1] || '')
+  const requestedPath = String(req.params?.[2] || '')
+  return proxyTerminalPreviewRequest(req, res, projectId, terminalId, requestedPath)
+})
+
 app.post('/api/projects/:projectId/live-session', authMiddleware, async (req, res) => {
   const { projectId } = req.params
   const { project, error } = assertProjectMembership(projectId, req.userId)
@@ -8463,6 +8541,10 @@ io.on('connection', (socket) => {
       return
     }
 
+    if (ensureReactViteDefaults(project)) {
+      scheduleProjectPersist(project.id, 0)
+    }
+
     if (project.sharedTerminalEnabled && !canEditProject(project, socket.userId)) {
       socket.emit('terminal:error', {
         projectId,
@@ -8566,6 +8648,7 @@ io.on('connection', (socket) => {
     const childEnv = {
       ...process.env,
       FORCE_COLOR: '0',
+      NPM_CONFIG_PACKAGE_LOCK: 'true',
     }
     delete childEnv.PORT
 
@@ -8599,6 +8682,10 @@ io.on('connection', (socket) => {
     })
 
     child.stdout.on('data', (chunk) => {
+      const detectedPort = detectLocalPreviewPort(chunk.toString())
+      if (detectedPort) {
+        session.previewPort = detectedPort
+      }
       emitTerminalEvent(project, session, 'terminal:output', {
         projectId,
         terminalId: normalizedTerminalId,
@@ -8608,6 +8695,10 @@ io.on('connection', (socket) => {
     })
 
     child.stderr.on('data', (chunk) => {
+      const detectedPort = detectLocalPreviewPort(chunk.toString())
+      if (detectedPort) {
+        session.previewPort = detectedPort
+      }
       emitTerminalEvent(project, session, 'terminal:output', {
         projectId,
         terminalId: normalizedTerminalId,
