@@ -2885,8 +2885,18 @@ const ensureFastApiRouteWiring = (project) => {
 const terminalSessionKey = (ownerUserId, projectId, terminalId) => `${ownerUserId}:${projectId}:${terminalId}`
 const userRoom = (userId) => `user:${userId}`
 const LOCAL_PREVIEW_URL_REGEX = /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})(?:[/?#][^\s]*)?/i
-const DEFAULT_PREVIEW_PORT_SCAN_START = Math.max(1, Number(process.env.PREVIEW_PORT_SCAN_START || 5173))
-const DEFAULT_PREVIEW_PORT_SCAN_END = Math.min(65535, Number(process.env.PREVIEW_PORT_SCAN_END || 5205))
+const DEFAULT_PREVIEW_PORT_CANDIDATES = [3000, 3001, 3002, 4173, 5173, 5174, 5175, 5176, 5177, 5178, 5179, 5180]
+
+const parsePreviewPortCandidates = (value = '') => {
+  const parsed = String(value || '')
+    .split(',')
+    .map((entry) => Number(String(entry || '').trim()))
+    .filter((port) => Number.isInteger(port) && port > 0 && port <= 65535)
+
+  return parsed.length ? parsed : DEFAULT_PREVIEW_PORT_CANDIDATES
+}
+
+const PREVIEW_PORT_CANDIDATES = parsePreviewPortCandidates(process.env.PREVIEW_PORT_CANDIDATES)
 
 const detectLocalPreviewPort = (text = '') => {
   const source = String(text || '')
@@ -2895,6 +2905,21 @@ const detectLocalPreviewPort = (text = '') => {
   const parsed = Number(match[1])
   if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) return null
   return parsed
+}
+
+const detectLocalPreviewPorts = (text = '') => {
+  const source = String(text || '')
+  const matches = source.matchAll(/https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})(?:[/?#][^\s]*)?/gi)
+  const ports = new Set()
+
+  for (const match of matches) {
+    const parsed = Number(match?.[1])
+    if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535) {
+      ports.add(parsed)
+    }
+  }
+
+  return Array.from(ports)
 }
 
 const looksLikeHtmlPreviewResponse = (statusCode, contentType, bodyText = '') => {
@@ -2931,9 +2956,19 @@ const resolveReachablePreviewPort = async (session) => {
   }
 
   const candidates = new Set()
-  for (let port = DEFAULT_PREVIEW_PORT_SCAN_START; port <= DEFAULT_PREVIEW_PORT_SCAN_END; port += 1) {
-    candidates.add(port)
+  const sessionCandidates = Array.isArray(session?.previewPortCandidates) ? session.previewPortCandidates : []
+
+  for (const candidate of sessionCandidates) {
+    const numericCandidate = Number(candidate)
+    if (Number.isInteger(numericCandidate) && numericCandidate >= 1 && numericCandidate <= 65535) {
+      candidates.add(numericCandidate)
+    }
   }
+
+  for (const candidate of PREVIEW_PORT_CANDIDATES) {
+    candidates.add(candidate)
+  }
+
   if (primary > 0) {
     candidates.add(primary)
     if (primary > 1) candidates.add(primary - 1)
@@ -6879,7 +6914,7 @@ app.get('/api/projects/:projectId/voice/participants', authMiddleware, async (re
 })
 
 const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requestedPath = '') => {
-  const allowPublicTerminalPreview = true
+  const allowPublicTerminalPreview = String(process.env.TERMINAL_PREVIEW_ALLOW_PUBLIC || 'true').trim().toLowerCase() !== 'false'
 
   let project = null
   let session = null
@@ -6908,6 +6943,10 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
     const resolvedPort = await resolveReachablePreviewPort(session)
     if (resolvedPort) {
       session.previewPort = resolvedPort
+    } else if (!normalizedPath) {
+      return res.status(404).json({
+        message: 'No active frontend preview detected. Run npm run dev inside the project terminal and wait for the Local URL.',
+      })
     }
   }
 
@@ -8725,6 +8764,7 @@ io.on('connection', (socket) => {
         cwd: workspaceDir,
         shellProfile: requestedShellProfile,
         child: null,
+        previewPortCandidates: [],
       }
 
     if (!session.shellProfile) {
@@ -8735,6 +8775,7 @@ io.on('connection', (socket) => {
       session.shellProfile = requestedShellProfile || session.shellProfile || 'default'
       session.previewPort = null
       session.previewUrl = ''
+      session.previewPortCandidates = []
     }
 
     if (trimmedCommand === 'cd' || trimmedCommand.startsWith('cd ')) {
@@ -8820,30 +8861,44 @@ io.on('connection', (socket) => {
     })
 
     child.stdout.on('data', (chunk) => {
-      const detectedPort = detectLocalPreviewPort(chunk.toString())
+      const chunkText = chunk.toString()
+      const detectedPort = detectLocalPreviewPort(chunkText)
       if (detectedPort) {
         session.previewPort = detectedPort
         session.previewUrl = `http://localhost:${detectedPort}`
+      }
+      const detectedPorts = detectLocalPreviewPorts(chunkText)
+      if (detectedPorts.length) {
+        const merged = new Set(Array.isArray(session.previewPortCandidates) ? session.previewPortCandidates : [])
+        for (const port of detectedPorts) merged.add(port)
+        session.previewPortCandidates = Array.from(merged)
       }
       emitTerminalEvent(project, session, 'terminal:output', {
         projectId,
         terminalId: normalizedTerminalId,
         stream: 'stdout',
-        text: chunk.toString(),
+        text: chunkText,
       })
     })
 
     child.stderr.on('data', (chunk) => {
-      const detectedPort = detectLocalPreviewPort(chunk.toString())
+      const chunkText = chunk.toString()
+      const detectedPort = detectLocalPreviewPort(chunkText)
       if (detectedPort) {
         session.previewPort = detectedPort
         session.previewUrl = `http://localhost:${detectedPort}`
+      }
+      const detectedPorts = detectLocalPreviewPorts(chunkText)
+      if (detectedPorts.length) {
+        const merged = new Set(Array.isArray(session.previewPortCandidates) ? session.previewPortCandidates : [])
+        for (const port of detectedPorts) merged.add(port)
+        session.previewPortCandidates = Array.from(merged)
       }
       emitTerminalEvent(project, session, 'terminal:output', {
         projectId,
         terminalId: normalizedTerminalId,
         stream: 'stderr',
-        text: chunk.toString(),
+        text: chunkText,
       })
     })
 
@@ -8929,6 +8984,7 @@ io.on('connection', (socket) => {
         cwd: workspaceDir,
         shellProfile: 'default',
         child: null,
+        previewPortCandidates: [],
       }
 
     if (!isPathInsideWorkspace(workspaceDir, session.cwd)) {
