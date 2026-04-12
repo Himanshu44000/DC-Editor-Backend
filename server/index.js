@@ -2934,8 +2934,10 @@ const parsePreviewPortCandidates = (value = '') => {
 
 const PREVIEW_PORT_CANDIDATES = parsePreviewPortCandidates(process.env.PREVIEW_PORT_CANDIDATES)
 
+const stripAnsiSequences = (value = '') => String(value || '').replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
+
 const detectLocalPreviewPort = (text = '') => {
-  const source = String(text || '')
+  const source = stripAnsiSequences(text)
   const match = source.match(LOCAL_PREVIEW_URL_REGEX)
   if (!match?.[1]) return null
   const parsed = Number(match[1])
@@ -2944,7 +2946,7 @@ const detectLocalPreviewPort = (text = '') => {
 }
 
 const detectLocalPreviewPorts = (text = '') => {
-  const source = String(text || '')
+  const source = stripAnsiSequences(text)
   const matches = source.matchAll(/https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})(?:[/?#][^\s]*)?/gi)
   const ports = new Set()
 
@@ -3607,7 +3609,28 @@ const resolveTerminalPreviewSession = (project, userId, terminalId = 'terminal-1
   const terminalOwnerUserId = project.sharedTerminalEnabled ? project.ownerId : userId
   const sessionKey = terminalSessionKey(terminalOwnerUserId, project.id, normalizedTerminalId)
   const session = terminalSessions.get(sessionKey)
-  return { session, normalizedTerminalId }
+  if (session) {
+    return { session, normalizedTerminalId }
+  }
+
+  const candidates = Array.from(terminalSessions.values()).filter((entry) => {
+    if (!entry) return false
+    if (entry.projectId !== project.id) return false
+    if (entry.terminalId !== normalizedTerminalId) return false
+    return true
+  })
+
+  if (!candidates.length) {
+    return { session: null, normalizedTerminalId }
+  }
+
+  const preferredOwnerId = project.sharedTerminalEnabled ? project.ownerId : userId
+  const preferred =
+    candidates.find((entry) => entry.ownerUserId === preferredOwnerId) ||
+    candidates.find((entry) => entry.child && !entry.child.killed) ||
+    candidates[0]
+
+  return { session: preferred || null, normalizedTerminalId }
 }
 
 const resolvePublicTerminalPreviewSession = (project, terminalId = 'terminal-1') => {
@@ -3616,7 +3639,10 @@ const resolvePublicTerminalPreviewSession = (project, terminalId = 'terminal-1')
     if (!session) return false
     if (session.projectId !== project.id) return false
     if (session.terminalId !== normalizedTerminalId) return false
-    return Boolean(session.previewPort)
+    if (session.previewPort) return true
+    if (Array.isArray(session.previewPortCandidates) && session.previewPortCandidates.length) return true
+    if (session.assignedDevPort) return true
+    return Boolean(session.child && !session.child.killed)
   })
 
   if (!candidates.length) {
