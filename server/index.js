@@ -3022,6 +3022,42 @@ const resolveReachablePreviewPort = async (session) => {
   return null
 }
 
+const collectSessionPreviewPortCandidates = (session) => {
+  const candidates = []
+  const seen = new Set()
+
+  const pushPort = (value) => {
+    const parsed = Number(value)
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) return
+    if (seen.has(parsed)) return
+    seen.add(parsed)
+    candidates.push(parsed)
+  }
+
+  pushPort(session?.previewPort)
+  const sessionCandidates = Array.isArray(session?.previewPortCandidates) ? session.previewPortCandidates : []
+  for (const candidate of sessionCandidates) pushPort(candidate)
+  pushPort(session?.assignedDevPort)
+  for (const candidate of PREVIEW_PORT_CANDIDATES) pushPort(candidate)
+
+  return candidates
+}
+
+const looksLikeCannotGetRoot = (bodyText = '') => /cannot\s+get\s+\//i.test(String(bodyText || ''))
+
+const shouldAcceptPreviewResponse = (statusCode, contentType, bodyText = '') => {
+  if (Number(statusCode) >= 500) return false
+  if (looksLikeHtmlPreviewResponse(statusCode, contentType, bodyText)) return true
+
+  const lowered = String(bodyText || '').toLowerCase()
+  // Next.js and some dev servers can return script-heavy HTML variants.
+  if (lowered.includes('__next') || lowered.includes('<div id="root"') || lowered.includes('<div id="__next"')) {
+    return true
+  }
+
+  return false
+}
+
 const getProjectTerminalWorkspace = (projectId, userId) => {
   const key = `${String(projectId || '')}:${String(userId || '')}`
   const digest = createHash('sha1').update(key).digest('hex').slice(0, 16)
@@ -7115,9 +7151,14 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
     if (resolvedPort) {
       session.previewPort = resolvedPort
     } else if (!normalizedPath) {
-      return res.status(404).json({
-        message: 'No active frontend preview detected. Run npm run dev inside the project terminal and wait for the Local URL.',
-      })
+      const fallbackCandidates = collectSessionPreviewPortCandidates(session)
+      if (fallbackCandidates.length) {
+        session.previewPort = fallbackCandidates[0]
+      } else {
+        return res.status(404).json({
+          message: 'No active frontend preview detected. Run npm run dev inside the project terminal and wait for the Local URL.',
+        })
+      }
     }
   }
 
@@ -7125,41 +7166,60 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
     return res.status(404).json({ message: 'No active preview server found for this terminal.' })
   }
 
-  const base = `http://127.0.0.1:${session.previewPort}`
-  const targetUrl = new URL(normalizedPath ? `/${normalizedPath}` : '/', base)
-
+  const candidatePorts = collectSessionPreviewPortCandidates(session)
   const originalUrl = String(req.originalUrl || '')
   const queryIndex = originalUrl.indexOf('?')
-  if (queryIndex >= 0) {
-    targetUrl.search = originalUrl.slice(queryIndex)
-  }
+  let lastProxyError = null
 
-  try {
-    const upstream = await fetch(targetUrl, {
-      method: 'GET',
-      headers: {
-        Accept: String(req.headers.accept || '*/*'),
-        'User-Agent': String(req.headers['user-agent'] || 'dc-editor-preview-proxy'),
-      },
-      redirect: 'manual',
-    })
-
-    for (const [headerName, headerValue] of upstream.headers.entries()) {
-      const normalizedHeader = String(headerName || '').toLowerCase()
-      if (normalizedHeader === 'connection') continue
-      if (normalizedHeader === 'transfer-encoding') continue
-      if (normalizedHeader === 'content-encoding') continue
-      res.setHeader(headerName, headerValue)
+  for (const candidatePort of candidatePorts) {
+    const base = `http://127.0.0.1:${candidatePort}`
+    const targetUrl = new URL(normalizedPath ? `/${normalizedPath}` : '/', base)
+    if (queryIndex >= 0) {
+      targetUrl.search = originalUrl.slice(queryIndex)
     }
 
-    const payload = Buffer.from(await upstream.arrayBuffer())
-    return res.status(upstream.status).send(payload)
-  } catch (proxyError) {
-    return res.status(502).json({
-      message: 'Preview server is not reachable. Start your app again in terminal and retry.',
-      details: String(proxyError?.message || 'unknown_error'),
-    })
+    try {
+      const upstream = await fetch(targetUrl, {
+        method: 'GET',
+        headers: {
+          Accept: String(req.headers.accept || '*/*'),
+          'User-Agent': String(req.headers['user-agent'] || 'dc-editor-preview-proxy'),
+        },
+        redirect: 'manual',
+      })
+
+      const payload = Buffer.from(await upstream.arrayBuffer())
+      const contentType = String(upstream.headers.get('content-type') || '')
+      const payloadText = normalizedPath ? '' : payload.toString('utf8')
+
+      if (!normalizedPath) {
+        const acceptable = shouldAcceptPreviewResponse(upstream.status, contentType, payloadText)
+        const clearlyWrong = looksLikeCannotGetRoot(payloadText)
+        if (!acceptable || clearlyWrong) {
+          continue
+        }
+      }
+
+      session.previewPort = candidatePort
+      for (const [headerName, headerValue] of upstream.headers.entries()) {
+        const normalizedHeader = String(headerName || '').toLowerCase()
+        if (normalizedHeader === 'connection') continue
+        if (normalizedHeader === 'transfer-encoding') continue
+        if (normalizedHeader === 'content-encoding') continue
+        res.setHeader(headerName, headerValue)
+      }
+
+      return res.status(upstream.status).send(payload)
+    } catch (proxyError) {
+      lastProxyError = proxyError
+      continue
+    }
   }
+
+  return res.status(502).json({
+    message: 'Preview server is not reachable. Start your app again in terminal and retry.',
+    details: String(lastProxyError?.message || 'no_matching_preview_server'),
+  })
 }
 
 app.get('/api/projects/:projectId/terminal-preview/:terminalId', optionalAuthMiddleware, async (req, res) => {
@@ -8941,6 +9001,7 @@ io.on('connection', (socket) => {
         child: null,
         previewPortCandidates: [],
         assignedDevPort: null,
+        outputBuffer: '',
       }
 
     if (!session.shellProfile) {
@@ -8952,6 +9013,7 @@ io.on('connection', (socket) => {
       session.previewPort = null
       session.previewUrl = ''
       session.previewPortCandidates = []
+      session.outputBuffer = ''
     }
 
     // Guard against stale session cwd values and force common run/install commands at project root.
@@ -9079,12 +9141,13 @@ io.on('connection', (socket) => {
 
     child.stdout.on('data', (chunk) => {
       const chunkText = chunk.toString()
+      session.outputBuffer = `${String(session.outputBuffer || '')}${chunkText}`.slice(-16000)
       const detectedPort = detectLocalPreviewPort(chunkText)
       if (detectedPort) {
         session.previewPort = detectedPort
         session.previewUrl = `http://localhost:${detectedPort}`
       }
-      const detectedPorts = detectLocalPreviewPorts(chunkText)
+      const detectedPorts = detectLocalPreviewPorts(`${session.outputBuffer}\n${chunkText}`)
       if (detectedPorts.length) {
         const merged = new Set(Array.isArray(session.previewPortCandidates) ? session.previewPortCandidates : [])
         for (const port of detectedPorts) merged.add(port)
@@ -9100,12 +9163,13 @@ io.on('connection', (socket) => {
 
     child.stderr.on('data', (chunk) => {
       const chunkText = chunk.toString()
+      session.outputBuffer = `${String(session.outputBuffer || '')}${chunkText}`.slice(-16000)
       const detectedPort = detectLocalPreviewPort(chunkText)
       if (detectedPort) {
         session.previewPort = detectedPort
         session.previewUrl = `http://localhost:${detectedPort}`
       }
-      const detectedPorts = detectLocalPreviewPorts(chunkText)
+      const detectedPorts = detectLocalPreviewPorts(`${session.outputBuffer}\n${chunkText}`)
       if (detectedPorts.length) {
         const merged = new Set(Array.isArray(session.previewPortCandidates) ? session.previewPortCandidates : [])
         for (const port of detectedPorts) merged.add(port)
@@ -9203,6 +9267,7 @@ io.on('connection', (socket) => {
         child: null,
         previewPortCandidates: [],
         assignedDevPort: null,
+        outputBuffer: '',
       }
 
     if (!isPathInsideWorkspace(workspaceDir, session.cwd)) {
