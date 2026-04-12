@@ -3369,6 +3369,23 @@ const resolveTerminalPreviewSession = (project, userId, terminalId = 'terminal-1
   return { session, normalizedTerminalId }
 }
 
+const resolvePublicTerminalPreviewSession = (project, terminalId = 'terminal-1') => {
+  const normalizedTerminalId = String(terminalId || 'terminal-1')
+  const candidates = Array.from(terminalSessions.values()).filter((session) => {
+    if (!session) return false
+    if (session.projectId !== project.id) return false
+    if (session.terminalId !== normalizedTerminalId) return false
+    return Boolean(session.previewPort)
+  })
+
+  if (!candidates.length) {
+    return { session: null, normalizedTerminalId }
+  }
+
+  const preferred = candidates.find((session) => project.sharedTerminalEnabled && session.ownerUserId === project.ownerId)
+  return { session: preferred || candidates[0], normalizedTerminalId }
+}
+
 const serializeProjectForDb = (project) => ({
   id: project.id,
   name: project.name,
@@ -4556,6 +4573,37 @@ const authMiddleware = async (req, res, next) => {
     next()
   } catch (error) {
     return res.status(401).json({ message: 'Invalid token' })
+  }
+}
+
+const optionalAuthMiddleware = async (req, _res, next) => {
+  if (!CLERK_SECRET_KEY) {
+    next()
+    return
+  }
+
+  try {
+    const auth = getAuth(req)
+    if (auth?.userId) {
+      req.userId = auth.userId
+      await ensureUserFromClaims(auth.userId, auth.sessionClaims || {})
+      next()
+      return
+    }
+
+    const header = req.headers.authorization || req.headers.Authorization
+    const bearer = typeof header === 'string' && header.startsWith('Bearer ') ? header.slice(7).trim() : ''
+    if (!bearer) {
+      next()
+      return
+    }
+
+    const payload = await verifyClerkAuthToken(bearer)
+    req.userId = payload.sub
+    await ensureUserFromClaims(payload.sub, payload)
+    next()
+  } catch {
+    next()
   }
 }
 
@@ -6768,12 +6816,28 @@ app.get('/api/projects/:projectId/voice/participants', authMiddleware, async (re
 })
 
 const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requestedPath = '') => {
-  const { project, error } = assertProjectMembership(projectId, req.userId)
-  if (error) {
-    return res.status(error.status).json({ message: error.message })
+  const allowPublicTerminalPreview = String(process.env.TERMINAL_PREVIEW_ALLOW_PUBLIC || 'true').trim().toLowerCase() !== 'false'
+
+  let project = null
+  let session = null
+
+  if (req.userId) {
+    const access = assertProjectMembership(projectId, req.userId)
+    if (access.error) {
+      return res.status(access.error.status).json({ message: access.error.message })
+    }
+    project = access.project
+    session = resolveTerminalPreviewSession(project, req.userId, terminalId).session
+  } else if (allowPublicTerminalPreview) {
+    project = projects.get(projectId)
+    if (!project) {
+      return res.status(404).json({ message: 'Project not found' })
+    }
+    session = resolvePublicTerminalPreviewSession(project, terminalId).session
+  } else {
+    return res.status(401).json({ message: 'Unauthorized' })
   }
 
-  const { session } = resolveTerminalPreviewSession(project, req.userId, terminalId)
   if (!session || !session.previewPort) {
     return res.status(404).json({ message: 'No active preview server found for this terminal.' })
   }
@@ -6816,11 +6880,11 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
   }
 }
 
-app.get('/api/projects/:projectId/terminal-preview/:terminalId', authMiddleware, async (req, res) => {
+app.get('/api/projects/:projectId/terminal-preview/:terminalId', optionalAuthMiddleware, async (req, res) => {
   return proxyTerminalPreviewRequest(req, res, req.params.projectId, req.params.terminalId, '')
 })
 
-app.get(/^\/api\/projects\/([^/]+)\/terminal-preview\/([^/]+)\/(.+)$/, authMiddleware, async (req, res) => {
+app.get(/^\/api\/projects\/([^/]+)\/terminal-preview\/([^/]+)\/(.+)$/, optionalAuthMiddleware, async (req, res) => {
   const projectId = String(req.params?.[0] || '')
   const terminalId = String(req.params?.[1] || '')
   const requestedPath = String(req.params?.[2] || '')
