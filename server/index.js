@@ -2798,6 +2798,42 @@ const ensureReactViteDefaults = (project) => {
   return true
 }
 
+const ensurePackageLockPolicyForProject = (project) => {
+  if (!project?.files || typeof project.files.values !== 'function') return false
+
+  const files = Array.from(project.files.values())
+  const packageJsonFile = files.find((file) => normalizePath(file?.path || file?.name) === 'package.json')
+  if (!packageJsonFile) return false
+
+  const npmRcFile = files.find((file) => normalizePath(file?.path || file?.name) === '.npmrc')
+  const policyLine = 'package-lock=true'
+
+  if (npmRcFile) {
+    const current = String(npmRcFile.content || '')
+    if (/^\s*package-lock\s*=\s*true\s*$/im.test(current)) return false
+    npmRcFile.content = `${current.trimEnd()}${current.trim() ? '\n' : ''}${policyLine}\n`
+    npmRcFile.updatedAt = nowIso()
+    npmRcFile.sizeBytes = Buffer.byteLength(npmRcFile.content, 'utf8')
+    project.updatedAt = npmRcFile.updatedAt
+    return true
+  }
+
+  const now = nowIso()
+  const fileId = randomUUID()
+  project.files.set(fileId, {
+    id: fileId,
+    name: '.npmrc',
+    path: '.npmrc',
+    content: `${policyLine}\n`,
+    isBinary: false,
+    mimeType: null,
+    sizeBytes: Buffer.byteLength(`${policyLine}\n`, 'utf8'),
+    updatedAt: now,
+  })
+  project.updatedAt = now
+  return true
+}
+
 const ensureFastApiRouteWiring = (project) => {
   if (project.templateId !== 'fastapi') return false
 
@@ -3378,6 +3414,52 @@ const getShellForCommand = (commandText, shellProfile = 'default') => {
     command: '/bin/bash',
     args: ['-lc', commandText],
   }
+}
+
+const isPackageManagerCommand = (commandText = '') => {
+  const normalized = String(commandText || '').trim().toLowerCase()
+  return /^(npm|pnpm|yarn|bun)(\s|$)/.test(normalized)
+}
+
+const shouldForceWorkspaceRootCommand = (commandText = '') => {
+  const normalized = String(commandText || '').trim().toLowerCase()
+  if (!isPackageManagerCommand(normalized)) return false
+  return /^(npm|pnpm|yarn|bun)\s+(i|install|run\s+dev|run\s+start|run\s+preview|dev|start|preview)(\s|$)/.test(normalized)
+}
+
+const quoteForShellPath = (value = '') => String(value || '').replace(/'/g, "''")
+
+const buildShellCommandForCwd = (commandText, cwd, shellProfile = 'default') => {
+  const normalizedProfile = normalizeShellProfile(shellProfile)
+
+  if (process.platform === 'win32') {
+    if (normalizedProfile === 'cmd') {
+      return `cd /d "${String(cwd || '').replace(/\"/g, '"')}" && ${commandText}`
+    }
+
+    // PowerShell / pwsh / default on Windows
+    return `Set-Location -LiteralPath '${quoteForShellPath(cwd)}'; ${commandText}`
+  }
+
+  // bash/sh/zsh
+  const escapedCwd = String(cwd || '').replace(/"/g, '\\"')
+  return `cd "${escapedCwd}" && ${commandText}`
+}
+
+const ensurePackageManagerTemplateFiles = (templateFiles = []) => {
+  const files = Array.isArray(templateFiles) ? [...templateFiles] : []
+  const hasPackageJson = files.some((file) => normalizePath(file?.path) === 'package.json')
+  if (!hasPackageJson) return files
+
+  const hasNpmRc = files.some((file) => normalizePath(file?.path) === '.npmrc')
+  if (!hasNpmRc) {
+    files.push({
+      path: '.npmrc',
+      content: 'package-lock=true\n',
+    })
+  }
+
+  return files
 }
 
 const stopTerminalProcess = (session) => {
@@ -6451,7 +6533,9 @@ app.post('/api/projects', authMiddleware, async (req, res) => {
     const createdAt = nowIso()
     const selectedTemplate = getTemplate(templateId || language)
     const selectedVariant = getTemplateVariant(selectedTemplate, templateVariantId)
-    const templateFiles = selectedTemplate.files({ name: trimmedName, variantId: selectedVariant?.id })
+    const templateFiles = ensurePackageManagerTemplateFiles(
+      selectedTemplate.files({ name: trimmedName, variantId: selectedVariant?.id }),
+    )
     const projectFiles = new Map()
     const projectFolders = new Set()
 
@@ -8720,6 +8804,10 @@ io.on('connection', (socket) => {
       scheduleProjectPersist(project.id, 0)
     }
 
+    if (ensurePackageLockPolicyForProject(project)) {
+      scheduleProjectPersist(project.id, 0)
+    }
+
     if (project.sharedTerminalEnabled && !canEditProject(project, socket.userId)) {
       socket.emit('terminal:error', {
         projectId,
@@ -8778,6 +8866,23 @@ io.on('connection', (socket) => {
       session.previewPortCandidates = []
     }
 
+    // Guard against stale session cwd values and force common run/install commands at project root.
+    if (!isPathInsideWorkspace(workspaceDir, session.cwd)) {
+      session.cwd = workspaceDir
+    } else {
+      try {
+        if (!fs.existsSync(session.cwd) || !fs.statSync(session.cwd).isDirectory()) {
+          session.cwd = workspaceDir
+        }
+      } catch {
+        session.cwd = workspaceDir
+      }
+    }
+
+    if (shouldForceWorkspaceRootCommand(trimmedCommand)) {
+      session.cwd = workspaceDir
+    }
+
     if (trimmedCommand === 'cd' || trimmedCommand.startsWith('cd ')) {
       const targetRaw = trimmedCommand === 'cd' ? '' : trimmedCommand.slice(3).trim()
       const nextPath = targetRaw
@@ -8823,7 +8928,8 @@ io.on('connection', (socket) => {
       return
     }
 
-    const shell = getShellForCommand(trimmedCommand, session.shellProfile)
+    const commandForShell = buildShellCommandForCwd(trimmedCommand, session.cwd, session.shellProfile)
+    const shell = getShellForCommand(commandForShell, session.shellProfile)
     const childEnv = {
       ...process.env,
       FORCE_COLOR: '0',
