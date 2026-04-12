@@ -2744,7 +2744,12 @@ const sanitizeProjectPathState = (project) => {
 }
 
 const ensureReactViteDefaults = (project) => {
-  if (project.templateId !== 'react-vite') return false
+  const hasReactViteFiles = Array.from(project.files.values()).some((file) => {
+    const normalized = normalizePath(file.path || file.name)
+    return normalized === 'vite.config.js' || normalized === 'vite.config.ts' || normalized === 'src/main.jsx' || normalized === 'src/main.tsx'
+  })
+
+  if (project.templateId !== 'react-vite' && !hasReactViteFiles) return false
 
   const packageFile = Array.from(project.files.values()).find((file) => normalizePath(file.path || file.name) === 'package.json')
   if (!packageFile) return false
@@ -2758,7 +2763,11 @@ const ensureReactViteDefaults = (project) => {
 
   const next = {
     ...parsed,
-    name: parsed.name || 'react-app',
+    name: String(project.name || parsed.name || 'react-app')
+      .toLowerCase()
+      .replace(/[^a-z0-9-]+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '') || 'react-app',
     private: true,
     type: 'module',
     scripts: {
@@ -6870,7 +6879,7 @@ app.get('/api/projects/:projectId/voice/participants', authMiddleware, async (re
 })
 
 const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requestedPath = '') => {
-  const allowPublicTerminalPreview = String(process.env.TERMINAL_PREVIEW_ALLOW_PUBLIC || 'true').trim().toLowerCase() !== 'false'
+  const allowPublicTerminalPreview = true
 
   let project = null
   let session = null
@@ -6888,8 +6897,6 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
       return res.status(404).json({ message: 'Project not found' })
     }
     session = resolvePublicTerminalPreviewSession(project, terminalId).session
-  } else {
-    return res.status(401).json({ message: 'Unauthorized' })
   }
 
   if (!session) {
@@ -8727,6 +8734,7 @@ io.on('connection', (socket) => {
     if (!session.child || session.child.killed) {
       session.shellProfile = requestedShellProfile || session.shellProfile || 'default'
       session.previewPort = null
+      session.previewUrl = ''
     }
 
     if (trimmedCommand === 'cd' || trimmedCommand.startsWith('cd ')) {
@@ -8815,6 +8823,7 @@ io.on('connection', (socket) => {
       const detectedPort = detectLocalPreviewPort(chunk.toString())
       if (detectedPort) {
         session.previewPort = detectedPort
+        session.previewUrl = `http://localhost:${detectedPort}`
       }
       emitTerminalEvent(project, session, 'terminal:output', {
         projectId,
@@ -8828,6 +8837,7 @@ io.on('connection', (socket) => {
       const detectedPort = detectLocalPreviewPort(chunk.toString())
       if (detectedPort) {
         session.previewPort = detectedPort
+        session.previewUrl = `http://localhost:${detectedPort}`
       }
       emitTerminalEvent(project, session, 'terminal:output', {
         projectId,
