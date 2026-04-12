@@ -3416,6 +3416,67 @@ const getShellForCommand = (commandText, shellProfile = 'default') => {
   }
 }
 
+const DEV_SERVER_PORT_MIN = Math.max(1024, Number(process.env.DEV_SERVER_PORT_MIN || 49000))
+const DEV_SERVER_PORT_MAX = Math.min(65535, Number(process.env.DEV_SERVER_PORT_MAX || 59000))
+
+const isInstallCommand = (commandText = '') => {
+  const normalized = String(commandText || '').trim().toLowerCase()
+  return /^(npm\s+(i|install|ci)|pnpm\s+(i|install)|yarn\s+install|bun\s+install)(\s|$)/.test(normalized)
+}
+
+const isLikelyDevServerCommand = (commandText = '') => {
+  const normalized = String(commandText || '').trim().toLowerCase()
+  return /^(npm\s+run\s+(dev|start|preview)|pnpm\s+(dev|start|preview)|yarn\s+(dev|start|preview)|bun\s+(run\s+)?(dev|start|preview)|next\s+dev|vite(\s|$)|nuxt\s+dev)(\s|$)/.test(normalized)
+}
+
+const normalizeInstallCommandForDevDeps = (commandText = '') => {
+  const raw = String(commandText || '').trim()
+  const normalized = raw.toLowerCase()
+  if (!isInstallCommand(raw)) return raw
+
+  if (/^npm\s+/.test(normalized)) {
+    const hasIncludeOrOmit = /\s--include=dev\b|\s--omit=dev\b|\s--production\b|\s--only=prod\b/i.test(raw)
+    return hasIncludeOrOmit ? raw : `${raw} --include=dev`
+  }
+
+  if (/^pnpm\s+/.test(normalized)) {
+    const hasProdFlag = /\s--prod\b|\s--prod=false\b|\s--dev\b/i.test(raw)
+    return hasProdFlag ? raw : `${raw} --prod=false`
+  }
+
+  return raw
+}
+
+const collectActiveDevServerPorts = () => {
+  const ports = new Set()
+  for (const session of terminalSessions.values()) {
+    const assigned = Number(session?.assignedDevPort || 0)
+    if (Number.isInteger(assigned) && assigned >= 1 && assigned <= 65535) {
+      ports.add(assigned)
+    }
+    const preview = Number(session?.previewPort || 0)
+    if (Number.isInteger(preview) && preview >= 1 && preview <= 65535) {
+      ports.add(preview)
+    }
+    const candidates = Array.isArray(session?.previewPortCandidates) ? session.previewPortCandidates : []
+    for (const candidate of candidates) {
+      const value = Number(candidate)
+      if (Number.isInteger(value) && value >= 1 && value <= 65535) {
+        ports.add(value)
+      }
+    }
+  }
+  return ports
+}
+
+const allocateDevServerPort = () => {
+  const used = collectActiveDevServerPorts()
+  for (let port = DEV_SERVER_PORT_MIN; port <= DEV_SERVER_PORT_MAX; port += 1) {
+    if (!used.has(port)) return port
+  }
+  return null
+}
+
 const isPackageManagerCommand = (commandText = '') => {
   const normalized = String(commandText || '').trim().toLowerCase()
   return /^(npm|pnpm|yarn|bun)(\s|$)/.test(normalized)
@@ -8853,6 +8914,7 @@ io.on('connection', (socket) => {
         shellProfile: requestedShellProfile,
         child: null,
         previewPortCandidates: [],
+        assignedDevPort: null,
       }
 
     if (!session.shellProfile) {
@@ -8928,7 +8990,8 @@ io.on('connection', (socket) => {
       return
     }
 
-    const commandForShell = buildShellCommandForCwd(trimmedCommand, session.cwd, session.shellProfile)
+    const normalizedCommand = normalizeInstallCommandForDevDeps(trimmedCommand)
+    const commandForShell = buildShellCommandForCwd(normalizedCommand, session.cwd, session.shellProfile)
     const shell = getShellForCommand(commandForShell, session.shellProfile)
     const childEnv = {
       ...process.env,
@@ -8936,6 +8999,28 @@ io.on('connection', (socket) => {
       NPM_CONFIG_PACKAGE_LOCK: 'true',
     }
     delete childEnv.PORT
+
+    if (isInstallCommand(normalizedCommand)) {
+      childEnv.NODE_ENV = 'development'
+      delete childEnv.NPM_CONFIG_PRODUCTION
+      delete childEnv.npm_config_production
+      childEnv.NPM_CONFIG_INCLUDE = 'dev'
+      childEnv.npm_config_include = 'dev'
+      delete childEnv.YARN_PRODUCTION
+    }
+
+    if (isLikelyDevServerCommand(normalizedCommand)) {
+      const assignedPort = Number(session.assignedDevPort || 0) || allocateDevServerPort()
+      if (assignedPort) {
+        session.assignedDevPort = assignedPort
+        childEnv.PORT = String(assignedPort)
+        childEnv.VITE_PORT = String(assignedPort)
+        childEnv.NEXT_PORT = String(assignedPort)
+        const mergedCandidates = new Set(Array.isArray(session.previewPortCandidates) ? session.previewPortCandidates : [])
+        mergedCandidates.add(assignedPort)
+        session.previewPortCandidates = Array.from(mergedCandidates)
+      }
+    }
 
     const child = spawn(shell.command, shell.args, {
       cwd: session.cwd,
@@ -8951,7 +9036,7 @@ io.on('connection', (socket) => {
     emitTerminalEvent(project, session, 'terminal:started', {
       projectId,
       terminalId: normalizedTerminalId,
-      command: trimmedCommand,
+      command: normalizedCommand,
       shellProfile: session.shellProfile,
       cwd: session.cwd,
       cwdDisplay: getTerminalCwdDisplay(workspaceDir, session.cwd),
@@ -9091,6 +9176,7 @@ io.on('connection', (socket) => {
         shellProfile: 'default',
         child: null,
         previewPortCandidates: [],
+        assignedDevPort: null,
       }
 
     if (!isPathInsideWorkspace(workspaceDir, session.cwd)) {
