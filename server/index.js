@@ -2875,7 +2875,9 @@ const ensureFastApiRouteWiring = (project) => {
 
 const terminalSessionKey = (ownerUserId, projectId, terminalId) => `${ownerUserId}:${projectId}:${terminalId}`
 const userRoom = (userId) => `user:${userId}`
-const LOCAL_PREVIEW_URL_REGEX = /https?:\/\/(?:localhost|127\.0\.0\.1):(\d{2,5})(?:[/?#][^\s]*)?/i
+const LOCAL_PREVIEW_URL_REGEX = /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})(?:[/?#][^\s]*)?/i
+const DEFAULT_PREVIEW_PORT_SCAN_START = Math.max(1, Number(process.env.PREVIEW_PORT_SCAN_START || 5173))
+const DEFAULT_PREVIEW_PORT_SCAN_END = Math.min(65535, Number(process.env.PREVIEW_PORT_SCAN_END || 5205))
 
 const detectLocalPreviewPort = (text = '') => {
   const source = String(text || '')
@@ -2884,6 +2886,58 @@ const detectLocalPreviewPort = (text = '') => {
   const parsed = Number(match[1])
   if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) return null
   return parsed
+}
+
+const looksLikeHtmlPreviewResponse = (statusCode, contentType, bodyText = '') => {
+  if (Number(statusCode) >= 400) return false
+  const ct = String(contentType || '').toLowerCase()
+  if (!ct.includes('text/html')) return false
+
+  const html = String(bodyText || '').toLowerCase()
+  return html.includes('<!doctype html') || html.includes('<html') || html.includes('/@vite/client')
+}
+
+const probePreviewPort = async (port) => {
+  const numericPort = Number(port)
+  if (!Number.isInteger(numericPort) || numericPort < 1 || numericPort > 65535) return false
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${numericPort}/`, {
+      method: 'GET',
+      headers: { Accept: 'text/html,*/*;q=0.8' },
+      redirect: 'manual',
+      signal: AbortSignal.timeout(1500),
+    })
+    const text = await response.text()
+    return looksLikeHtmlPreviewResponse(response.status, response.headers.get('content-type'), text)
+  } catch {
+    return false
+  }
+}
+
+const resolveReachablePreviewPort = async (session) => {
+  const primary = Number(session?.previewPort || 0)
+  if (primary && (await probePreviewPort(primary))) {
+    return primary
+  }
+
+  const candidates = new Set()
+  for (let port = DEFAULT_PREVIEW_PORT_SCAN_START; port <= DEFAULT_PREVIEW_PORT_SCAN_END; port += 1) {
+    candidates.add(port)
+  }
+  if (primary > 0) {
+    candidates.add(primary)
+    if (primary > 1) candidates.add(primary - 1)
+    candidates.add(primary + 1)
+  }
+
+  for (const candidate of candidates) {
+    if (await probePreviewPort(candidate)) {
+      return candidate
+    }
+  }
+
+  return null
 }
 
 const getProjectTerminalWorkspace = (projectId, userId) => {
@@ -6838,11 +6892,22 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
     return res.status(401).json({ message: 'Unauthorized' })
   }
 
-  if (!session || !session.previewPort) {
+  if (!session) {
     return res.status(404).json({ message: 'No active preview server found for this terminal.' })
   }
 
   const normalizedPath = String(requestedPath || '').replace(/^\/+/, '')
+  if (!session.previewPort || !normalizedPath) {
+    const resolvedPort = await resolveReachablePreviewPort(session)
+    if (resolvedPort) {
+      session.previewPort = resolvedPort
+    }
+  }
+
+  if (!session.previewPort) {
+    return res.status(404).json({ message: 'No active preview server found for this terminal.' })
+  }
+
   const base = `http://127.0.0.1:${session.previewPort}`
   const targetUrl = new URL(normalizedPath ? `/${normalizedPath}` : '/', base)
 
@@ -8661,6 +8726,7 @@ io.on('connection', (socket) => {
 
     if (!session.child || session.child.killed) {
       session.shellProfile = requestedShellProfile || session.shellProfile || 'default'
+      session.previewPort = null
     }
 
     if (trimmedCommand === 'cd' || trimmedCommand.startsWith('cd ')) {
