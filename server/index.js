@@ -3107,6 +3107,22 @@ const rewritePreviewAssetTextForProxy = (assetText, projectId, terminalId) => {
   return rewritten
 }
 
+const sanitizeTerminalOutputForUi = (text = '') => {
+  const normalized = String(text || '').replace(/http:\/\/0\.0\.0\.0:(\d{2,5})/gi, 'http://localhost:$1')
+  const lines = normalized.split(/\r?\n/)
+  const filtered = lines.filter((line) => {
+    const value = String(line || '')
+    if (!value.trim()) return true
+    if (/non-standard\s+"?node_env"?/i.test(value)) return false
+    if (/nextjs\.org\/docs\/messages\/non-standard-node-env/i.test(value)) return false
+    if (/we detected typescript in your project and reconfigured your tsconfig\.json file/i.test(value)) return false
+    if (/the following suggested values were added to your tsconfig\.json/i.test(value)) return false
+    if (/include was updated to add '\.next\/dev\/dev\/types\/\*\*\/\*\.ts'/i.test(value)) return false
+    return true
+  })
+  return filtered.join('\n')
+}
+
 const collectPreviewBaseCandidates = (session, port) => {
   const numericPort = Number(port)
   if (!Number.isInteger(numericPort) || numericPort < 1 || numericPort > 65535) return []
@@ -7320,71 +7336,77 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
       targetUrl.search = originalUrl.slice(queryIndex)
     }
 
-    try {
-      const controller = new AbortController()
-      const timeoutHandle = setTimeout(() => controller.abort(), 8000)
+    const maxAttempts = normalizedPath ? 1 : 2
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const controller = new AbortController()
+        const timeoutMs = normalizedPath ? 15000 : 45000
+        const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs)
 
-      const upstream = await fetch(String(targetUrl), {
-        method: 'GET',
-        headers: {
-          Accept: String(req.headers.accept || '*/*'),
-          'User-Agent': String(req.headers['user-agent'] || 'dc-editor-preview-proxy'),
-        },
-        redirect: 'manual',
-        signal: controller.signal,
-      })
+        const upstream = await fetch(String(targetUrl), {
+          method: 'GET',
+          headers: {
+            Accept: String(req.headers.accept || '*/*'),
+            'User-Agent': String(req.headers['user-agent'] || 'dc-editor-preview-proxy'),
+          },
+          redirect: 'manual',
+          signal: controller.signal,
+        })
 
-      clearTimeout(timeoutHandle)
+        clearTimeout(timeoutHandle)
 
-      if (!normalizedPath) {
-        const text = await upstream.text()
-        const contentType = String(upstream.headers.get('content-type') || '')
-        const acceptable = shouldAcceptPreviewResponse(upstream.status, contentType, text)
+        if (!normalizedPath) {
+          const text = await upstream.text()
+          const contentType = String(upstream.headers.get('content-type') || '')
+          const acceptable = shouldAcceptPreviewResponse(upstream.status, contentType, text)
 
-        if (!acceptable) {
-          lastError = new Error(`invalid_preview_response:${upstream.status}`)
-          lastTargetUrl = String(targetUrl)
-          continue
+          if (!acceptable) {
+            lastError = new Error(`invalid_preview_response:${upstream.status}`)
+            lastTargetUrl = String(targetUrl)
+            continue
+          }
+
+          session.previewPort = previewPort
+          const rewrittenHtml = rewritePreviewHtmlForProxy(text, projectId, terminalId)
+          res.setHeader('Content-Type', contentType || 'text/html; charset=utf-8')
+          return res.status(upstream.status).send(rewrittenHtml)
         }
 
-        session.previewPort = previewPort
-        const rewrittenHtml = rewritePreviewHtmlForProxy(text, projectId, terminalId)
-        res.setHeader('Content-Type', contentType || 'text/html; charset=utf-8')
-        return res.status(upstream.status).send(rewrittenHtml)
-      }
+        const payload = Buffer.from(await upstream.arrayBuffer())
+        const contentType = String(upstream.headers.get('content-type') || '')
 
-      const payload = Buffer.from(await upstream.arrayBuffer())
-      const contentType = String(upstream.headers.get('content-type') || '')
+        if (shouldRewritePreviewAssetResponse(contentType, normalizedPath)) {
+          const rewrittenText = rewritePreviewAssetTextForProxy(payload.toString('utf8'), projectId, terminalId)
+          for (const [headerName, headerValue] of upstream.headers.entries()) {
+            const normalizedHeader = String(headerName || '').toLowerCase()
+            if (normalizedHeader === 'connection') continue
+            if (normalizedHeader === 'transfer-encoding') continue
+            if (normalizedHeader === 'content-encoding') continue
+            if (normalizedHeader === 'content-length') continue
+            res.setHeader(headerName, headerValue)
+          }
 
-      if (shouldRewritePreviewAssetResponse(contentType, normalizedPath)) {
-        const rewrittenText = rewritePreviewAssetTextForProxy(payload.toString('utf8'), projectId, terminalId)
+          session.previewPort = previewPort
+          return res.status(upstream.status).send(rewrittenText)
+        }
+
         for (const [headerName, headerValue] of upstream.headers.entries()) {
           const normalizedHeader = String(headerName || '').toLowerCase()
           if (normalizedHeader === 'connection') continue
           if (normalizedHeader === 'transfer-encoding') continue
           if (normalizedHeader === 'content-encoding') continue
-          if (normalizedHeader === 'content-length') continue
           res.setHeader(headerName, headerValue)
         }
 
         session.previewPort = previewPort
-        return res.status(upstream.status).send(rewrittenText)
+        return res.status(upstream.status).send(payload)
+      } catch (error) {
+        lastError = error
+        lastTargetUrl = String(targetUrl)
+        if (attempt >= maxAttempts) {
+          continue
+        }
       }
-
-      for (const [headerName, headerValue] of upstream.headers.entries()) {
-        const normalizedHeader = String(headerName || '').toLowerCase()
-        if (normalizedHeader === 'connection') continue
-        if (normalizedHeader === 'transfer-encoding') continue
-        if (normalizedHeader === 'content-encoding') continue
-        res.setHeader(headerName, headerValue)
-      }
-
-      session.previewPort = previewPort
-      return res.status(upstream.status).send(payload)
-    } catch (error) {
-      lastError = error
-      lastTargetUrl = String(targetUrl)
-      continue
     }
   }
 
@@ -9373,12 +9395,15 @@ io.on('connection', (socket) => {
         for (const port of detectedPorts) merged.add(port)
         session.previewPortCandidates = Array.from(merged)
       }
-      emitTerminalEvent(project, session, 'terminal:output', {
-        projectId,
-        terminalId: normalizedTerminalId,
-        stream: 'stdout',
-        text: chunkText,
-      })
+      const uiChunkText = sanitizeTerminalOutputForUi(chunkText)
+      if (uiChunkText.trim()) {
+        emitTerminalEvent(project, session, 'terminal:output', {
+          projectId,
+          terminalId: normalizedTerminalId,
+          stream: 'stdout',
+          text: uiChunkText,
+        })
+      }
     })
 
     child.stderr.on('data', (chunk) => {
@@ -9404,12 +9429,15 @@ io.on('connection', (socket) => {
         for (const port of detectedPorts) merged.add(port)
         session.previewPortCandidates = Array.from(merged)
       }
-      emitTerminalEvent(project, session, 'terminal:output', {
-        projectId,
-        terminalId: normalizedTerminalId,
-        stream: 'stderr',
-        text: chunkText,
-      })
+      const uiChunkText = sanitizeTerminalOutputForUi(chunkText)
+      if (uiChunkText.trim()) {
+        emitTerminalEvent(project, session, 'terminal:output', {
+          projectId,
+          terminalId: normalizedTerminalId,
+          stream: 'stderr',
+          text: uiChunkText,
+        })
+      }
     })
 
     child.on('error', (childError) => {
