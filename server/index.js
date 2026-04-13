@@ -3082,6 +3082,31 @@ const rewritePreviewHtmlForProxy = (htmlText, projectId, terminalId) => {
   return rewritten
 }
 
+const shouldRewritePreviewAssetResponse = (contentType = '', requestedPath = '') => {
+  const ct = String(contentType || '').toLowerCase()
+  if (ct.includes('javascript') || ct.includes('ecmascript') || ct.includes('typescript')) return true
+  if (ct.includes('text/css')) return true
+
+  const pathValue = String(requestedPath || '').toLowerCase()
+  return /\.(mjs|js|jsx|ts|tsx|css)(?:\?|$)/i.test(pathValue)
+}
+
+const rewritePreviewAssetTextForProxy = (assetText, projectId, terminalId) => {
+  const text = String(assetText || '')
+  if (!text) return text
+
+  const previewBasePath = `/api/projects/${encodeURIComponent(String(projectId || ''))}/terminal-preview/${encodeURIComponent(String(terminalId || ''))}/`
+  let rewritten = text
+
+  // Keep Vite/module absolute imports under the preview proxy route.
+  rewritten = rewritten.replace(/(["'`])\/(?!\/)(@vite\/|src\/|node_modules\/|@id\/|@fs\/|__vite_ping|vite\.svg|assets\/)/g, `$1${previewBasePath}$2`)
+
+  // Keep CSS root-relative URLs under preview proxy route.
+  rewritten = rewritten.replace(/url\((['"]?)\/(?!\/)/gi, `url($1${previewBasePath}`)
+
+  return rewritten
+}
+
 const collectPreviewBaseCandidates = (session, port) => {
   const numericPort = Number(port)
   if (!Number.isInteger(numericPort) || numericPort < 1 || numericPort > 65535) return []
@@ -7271,6 +7296,23 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
       }
 
       const payload = Buffer.from(await upstream.arrayBuffer())
+      const contentType = String(upstream.headers.get('content-type') || '')
+
+      if (shouldRewritePreviewAssetResponse(contentType, normalizedPath)) {
+        const rewrittenText = rewritePreviewAssetTextForProxy(payload.toString('utf8'), projectId, terminalId)
+        for (const [headerName, headerValue] of upstream.headers.entries()) {
+          const normalizedHeader = String(headerName || '').toLowerCase()
+          if (normalizedHeader === 'connection') continue
+          if (normalizedHeader === 'transfer-encoding') continue
+          if (normalizedHeader === 'content-encoding') continue
+          if (normalizedHeader === 'content-length') continue
+          res.setHeader(headerName, headerValue)
+        }
+
+        session.previewPort = previewPort
+        return res.status(upstream.status).send(rewrittenText)
+      }
+
       for (const [headerName, headerValue] of upstream.headers.entries()) {
         const normalizedHeader = String(headerName || '').toLowerCase()
         if (normalizedHeader === 'connection') continue
