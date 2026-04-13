@@ -3551,6 +3551,64 @@ const isLikelyDevServerCommand = (commandText = '') => {
   return /^(npm\s+run\s+(dev|start|preview)|pnpm\s+(dev|start|preview)|yarn\s+(dev|start|preview)|bun\s+(run\s+)?(dev|start|preview)|next\s+dev|vite(\s|$)|nuxt\s+dev)(\s|$)/.test(normalized)
 }
 
+const detectDevServerFramework = (cwd = '') => {
+  try {
+    const packagePath = path.join(String(cwd || ''), 'package.json')
+    if (!fs.existsSync(packagePath)) return null
+
+    const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8'))
+    const scriptBlob = [packageJson?.scripts?.dev, packageJson?.scripts?.start, packageJson?.scripts?.preview]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase()
+
+    if (scriptBlob.includes('next')) return 'next'
+    if (scriptBlob.includes('nuxt')) return 'nuxt'
+    if (scriptBlob.includes('vite')) return 'vite'
+    if (scriptBlob.includes('vue-cli-service')) return 'vue-cli'
+    if (scriptBlob.includes('astro')) return 'astro'
+  } catch (error) {
+    void error
+  }
+
+  return null
+}
+
+const buildDevServerCommandForPort = (commandText, cwd, assignedPort) => {
+  const port = Number(assignedPort)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return String(commandText || '')
+
+  const raw = String(commandText || '').trim()
+  if (!isLikelyDevServerCommand(raw)) return raw
+
+  if (/\b(--port|-p|--host|-H|--hostname)\b/i.test(raw)) {
+    return raw
+  }
+
+  const framework = detectDevServerFramework(cwd)
+  const extraArgs = framework === 'next'
+    ? ` -- --hostname 0.0.0.0 --port ${port}`
+    : ` -- --host 0.0.0.0 --port ${port}`
+
+  if (/^(npm|pnpm|yarn|bun)\s+run\s+(dev|start|preview)(\s|$)/i.test(raw)) {
+    return `${raw}${extraArgs}`
+  }
+
+  if (/^next\s+dev(\s|$)/i.test(raw)) {
+    return `${raw} --hostname 0.0.0.0 --port ${port}`
+  }
+
+  if (/^vite(\s|$)/i.test(raw)) {
+    return `${raw} --host 0.0.0.0 --port ${port}`
+  }
+
+  if (/^nuxt\s+dev(\s|$)/i.test(raw)) {
+    return `${raw} --host 0.0.0.0 --port ${port}`
+  }
+
+  return raw
+}
+
 const normalizeInstallCommandForDevDeps = (commandText = '') => {
   const raw = String(commandText || '').trim()
   const normalized = raw.toLowerCase()
@@ -9217,7 +9275,10 @@ io.on('connection', (socket) => {
     }
 
     const normalizedCommand = normalizeInstallCommandForDevDeps(trimmedCommand)
-    const commandForShell = buildShellCommandForCwd(normalizedCommand, session.cwd, session.shellProfile)
+    const commandForExecution = isLikelyDevServerCommand(normalizedCommand) && session.assignedDevPort
+      ? buildDevServerCommandForPort(normalizedCommand, session.cwd, session.assignedDevPort)
+      : normalizedCommand
+    const commandForShell = buildShellCommandForCwd(commandForExecution, session.cwd, session.shellProfile)
     const shell = getShellForCommand(commandForShell, session.shellProfile)
     const childEnv = {
       ...process.env,
@@ -9236,6 +9297,7 @@ io.on('connection', (socket) => {
     }
 
     if (isLikelyDevServerCommand(normalizedCommand)) {
+      childEnv.NODE_ENV = 'development'
       const assignedPort = Number(session.assignedDevPort || 0) || allocateDevServerPort()
       if (assignedPort) {
         session.assignedDevPort = assignedPort
