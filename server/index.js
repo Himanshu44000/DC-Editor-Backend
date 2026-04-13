@@ -3058,6 +3058,30 @@ const shouldAcceptPreviewResponse = (statusCode, contentType, bodyText = '') => 
   return false
 }
 
+const escapeRegExp = (value = '') => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+const rewritePreviewHtmlForProxy = (htmlText, projectId, terminalId) => {
+  const html = String(htmlText || '')
+  if (!html) return html
+
+  const previewBasePath = `/api/projects/${encodeURIComponent(String(projectId || ''))}/terminal-preview/${encodeURIComponent(String(terminalId || ''))}/`
+  let rewritten = html
+
+  // Force root-relative asset URLs through preview proxy path.
+  rewritten = rewritten.replace(/\b(src|href)=(["'])\/(?!\/)/gi, `$1=$2${previewBasePath}`)
+
+  // Add <base> tag so relative paths also resolve under preview route.
+  if (!/\<base\s+/i.test(rewritten)) {
+    rewritten = rewritten.replace(/<head([^>]*)>/i, `<head$1><base href="${previewBasePath}">`)
+  }
+
+  // Make websocket endpoint (if present) relative to current origin/path.
+  const hostPattern = new RegExp(escapeRegExp('"ws://localhost:'), 'gi')
+  rewritten = rewritten.replace(hostPattern, '"ws://')
+
+  return rewritten
+}
+
 const collectPreviewBaseCandidates = (session, port) => {
   const numericPort = Number(port)
   if (!Number.isInteger(numericPort) || numericPort < 1 || numericPort > 65535) return []
@@ -7241,8 +7265,9 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
         }
 
         session.previewPort = previewPort
+        const rewrittenHtml = rewritePreviewHtmlForProxy(text, projectId, terminalId)
         res.setHeader('Content-Type', contentType || 'text/html; charset=utf-8')
-        return res.status(upstream.status).send(text)
+        return res.status(upstream.status).send(rewrittenHtml)
       }
 
       const payload = Buffer.from(await upstream.arrayBuffer())
@@ -7289,6 +7314,11 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
 }
 
 app.get('/api/projects/:projectId/terminal-preview/:terminalId', optionalAuthMiddleware, async (req, res) => {
+  const pathWithoutQuery = String(req.originalUrl || '').split('?')[0]
+  if (!pathWithoutQuery.endsWith('/')) {
+    const suffix = String(req.originalUrl || '').slice(pathWithoutQuery.length)
+    return res.redirect(302, `${pathWithoutQuery}/${suffix}`)
+  }
   return proxyTerminalPreviewRequest(req, res, req.params.projectId, req.params.terminalId, '')
 })
 
