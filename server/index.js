@@ -9829,19 +9829,9 @@ io.on('connection', (socket) => {
   })
 
   socket.on('disconnect', async () => {
-    const disconnectTimer = setTimeout(async () => {
-      try {
-        const activeSockets = await io.fetchSockets()
-        const stillConnected = activeSockets.some((activeSocket) => activeSocket.userId === socket.userId)
-        if (!stillConnected) {
-          await stopAllTerminalsForUserId(socket.userId)
-        }
-      } finally {
-        terminalDisconnectStopTimers.delete(socket.userId)
-      }
-    }, 3000)
-
-    terminalDisconnectStopTimers.set(socket.userId, disconnectTimer)
+    // Keep terminal processes alive across temporary browser/socket disconnects.
+    // Stopping them here causes preview sessions to disappear before the user can open them.
+    terminalDisconnectStopTimers.delete(socket.userId)
 
     const rooms = Array.from(socket.rooms)
     for (const roomName of rooms) {
