@@ -3171,14 +3171,15 @@ const collectPreviewBaseCandidates = (session, port) => {
   const pushBase = (host) => {
     const normalizedHost = String(host || '').trim().toLowerCase()
     if (!normalizedHost) return
+    if (!['localhost', '127.0.0.1'].includes(normalizedHost)) return
     if (seen.has(normalizedHost)) return
     seen.add(normalizedHost)
-    if (normalizedHost === '::1') {
-      candidates.push(`http://[::1]:${numericPort}`)
-      return
-    }
     candidates.push(`http://${normalizedHost}:${numericPort}`)
   }
+
+  // Prefer stable local targets first.
+  pushBase('localhost')
+  pushBase('127.0.0.1')
 
   const fromOutput = String(session?.outputBuffer || '')
   const matches = fromOutput.matchAll(/https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|::1):(\d{2,5})(?:[/?#][^\s]*)?/gi)
@@ -3187,12 +3188,6 @@ const collectPreviewBaseCandidates = (session, port) => {
     const matchPort = Number(match?.[2])
     if (matchPort === numericPort) pushBase(host)
   }
-
-  pushBase('localhost')
-  pushBase('127.0.0.1')
-
-  // Avoid non-routable/fragile candidates in containerized environments.
-  // 0.0.0.0 is a bind address (not a destination), and ::1 may not be bound.
 
   return candidates
 }
@@ -7410,7 +7405,9 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
   let lastError = null
   let lastTargetUrl = ''
 
-  for (const base of targetBases) {
+  const basesToTry = normalizedPath ? targetBases : targetBases.slice(0, 1)
+
+  for (const base of basesToTry) {
     const targetUrl = new URL(normalizedPath ? `/${normalizedPath}` : '/', base)
     if (queryIndex >= 0) {
       targetUrl.search = originalUrl.slice(queryIndex)
@@ -7420,20 +7417,23 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         const controller = new AbortController()
-        const timeoutMs = normalizedPath ? 10000 : 8000
+        const timeoutMs = normalizedPath ? 15000 : 60000
         const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs)
 
-        const upstream = await fetch(String(targetUrl), {
-          method: 'GET',
-          headers: {
-            Accept: String(req.headers.accept || '*/*'),
-            'User-Agent': String(req.headers['user-agent'] || 'dc-editor-preview-proxy'),
-          },
-          redirect: 'manual',
-          signal: controller.signal,
-        })
-
-        clearTimeout(timeoutHandle)
+        let upstream
+        try {
+          upstream = await fetch(String(targetUrl), {
+            method: 'GET',
+            headers: {
+              Accept: String(req.headers.accept || '*/*'),
+              'User-Agent': String(req.headers['user-agent'] || 'dc-editor-preview-proxy'),
+            },
+            redirect: 'manual',
+            signal: controller.signal,
+          })
+        } finally {
+          clearTimeout(timeoutHandle)
+        }
 
         if (!normalizedPath) {
           const text = await upstream.text()
