@@ -3637,7 +3637,7 @@ const buildDevServerCommandForPort = (commandText, cwd, assignedPort) => {
 
   const framework = detectDevServerFramework(cwd)
   const extraArgs = framework === 'next'
-    ? ` -- --hostname 0.0.0.0 --port ${port}`
+    ? ` -- --hostname 0.0.0.0 --port ${port} --webpack`
     : ` -- --host 0.0.0.0 --port ${port}`
 
   if (/^(npm|pnpm|yarn|bun)\s+run\s+(dev|start|preview)(\s|$)/i.test(raw)) {
@@ -3645,7 +3645,7 @@ const buildDevServerCommandForPort = (commandText, cwd, assignedPort) => {
   }
 
   if (/^next\s+dev(\s|$)/i.test(raw)) {
-    return `${raw} --hostname 0.0.0.0 --port ${port}`
+    return `${raw} --hostname 0.0.0.0 --port ${port} --webpack`
   }
 
   if (/^vite(\s|$)/i.test(raw)) {
@@ -7511,6 +7511,10 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
       attempted_target: lastTargetUrl,
       attempted_bases: targetBases,
       path: normalizedPath,
+      child_alive: Boolean(session?.child && !session.child.killed),
+      assigned_port: Number(session?.assignedDevPort || 0) || null,
+      preview_port: Number(session?.previewPort || 0) || null,
+      output_tail: String(session?.outputBuffer || '').slice(-1200),
     },
   })
 }
