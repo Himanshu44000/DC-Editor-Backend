@@ -3058,7 +3058,9 @@ const looksLikeCannotGetRoot = (bodyText = '') => /cannot\s+get\s+\//i.test(Stri
 
 const shouldAcceptPreviewResponse = (statusCode, contentType, bodyText = '') => {
   if (Number(statusCode) >= 500) return false
-  if (looksLikeHtmlPreviewResponse(statusCode, contentType, bodyText)) return true
+  const normalizedType = String(contentType || '').toLowerCase()
+  if (looksLikeHtmlPreviewResponse(statusCode, normalizedType, bodyText)) return true
+  if (normalizedType.includes('text/html') && Number(statusCode) < 500) return true
 
   const lowered = String(bodyText || '').toLowerCase()
   // Next.js and some dev servers can return script-heavy HTML variants.
@@ -7481,13 +7483,6 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
     const maxAttempts = normalizedPath ? 1 : 2
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
-        if (!normalizedPath) {
-          const ready = await probePreviewPort(previewPort, 1200)
-          if (!ready) {
-            return res.status(200).send(buildPreviewRetryHtml(projectId, terminalId))
-          }
-        }
-
         const controller = new AbortController()
         const timeoutMs = normalizedPath ? 10000 : 8000
         const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs)
