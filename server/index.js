@@ -141,6 +141,9 @@ const GITHUB_CLIENT_ID = String(process.env.GITHUB_CLIENT_ID || '').trim()
 const GITHUB_CLIENT_SECRET = String(process.env.GITHUB_CLIENT_SECRET || '').trim()
 const GITHUB_OAUTH_CALLBACK_URL = String(process.env.GITHUB_OAUTH_CALLBACK_URL || 'http://localhost:4000/api/github/oauth/callback').trim()
 const FRONTEND_BASE_URL = String(process.env.FRONTEND_BASE_URL || 'http://localhost:5173').trim()
+const PREVIEW_PUBLIC_BASE_URL = String(
+  process.env.PREVIEW_PUBLIC_BASE_URL || process.env.BACKEND_PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '',
+).trim()
 const GITHUB_DEFAULT_COMMIT_MESSAGE = 'Initial upload from DC Editor'
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim()
 const GEMINI_MODEL = String(process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim()
@@ -252,6 +255,14 @@ app.use(
     hsts: IS_PRODUCTION,
   }),
 )
+
+app.use((req, _res, next) => {
+  // Normalize accidental leading double slashes (e.g. //api/...) to prevent false 404s.
+  if (typeof req.url === 'string' && req.url.startsWith('//')) {
+    req.url = req.url.replace(/^\/\/+/, '/')
+  }
+  next()
+})
 
 app.use((req, res, next) => {
   if (!FORCE_HTTPS) {
@@ -3107,14 +3118,30 @@ const rewritePreviewAssetTextForProxy = (assetText, projectId, terminalId) => {
   return rewritten
 }
 
-const sanitizeTerminalOutputForUi = (text = '', projectId = '', terminalId = '') => {
+const resolvePreviewPublicBaseUrl = (socket) => {
+  const explicit = String(PREVIEW_PUBLIC_BASE_URL || '').trim().replace(/\/+$/, '')
+  if (explicit) return explicit
+
+  const forwardedProto = String(socket?.handshake?.headers?.['x-forwarded-proto'] || '').trim().toLowerCase()
+  const forwardedHost = String(socket?.handshake?.headers?.['x-forwarded-host'] || '').trim()
+  const host = forwardedHost || String(socket?.handshake?.headers?.host || '').trim()
+  if (!host) return ''
+
+  const protocol = forwardedProto === 'https' ? 'https' : 'http'
+  return `${protocol}://${host}`
+}
+
+const sanitizeTerminalOutputForUi = (text = '', projectId = '', terminalId = '', previewPublicBaseUrl = '') => {
   const proxyBasePath = projectId && terminalId
     ? `/api/projects/${encodeURIComponent(String(projectId || ''))}/terminal-preview/${encodeURIComponent(String(terminalId || ''))}/`
     : ''
+  const absolutePreviewUrl = previewPublicBaseUrl && proxyBasePath
+    ? `${String(previewPublicBaseUrl || '').replace(/\/+$/, '')}${proxyBasePath}`
+    : proxyBasePath
 
   let normalized = String(text || '').replace(/http:\/\/0\.0\.0\.0:(\d{2,5})/gi, 'http://localhost:$1')
   if (proxyBasePath) {
-    normalized = normalized.replace(/https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|::1):(\d{2,5})\/?/gi, proxyBasePath)
+    normalized = normalized.replace(/https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|::1):(\d{2,5})\/?/gi, absolutePreviewUrl)
   }
 
   const lines = normalized.split(/\r?\n/)
@@ -9384,6 +9411,7 @@ io.on('connection', (socket) => {
     const normalizedCommand = normalizeInstallCommandForDevDeps(trimmedCommand)
     const isDevServerCommand = isLikelyDevServerCommand(normalizedCommand)
     let assignedDevPort = null
+    const previewPublicBaseUrl = resolvePreviewPublicBaseUrl(socket)
 
     if (isDevServerCommand) {
       assignedDevPort = Number(session.assignedDevPort || 0) || allocateDevServerPort()
@@ -9480,7 +9508,7 @@ io.on('connection', (socket) => {
         for (const port of detectedPorts) merged.add(port)
         session.previewPortCandidates = Array.from(merged)
       }
-      const uiChunkText = sanitizeTerminalOutputForUi(chunkText, projectId, normalizedTerminalId)
+      const uiChunkText = sanitizeTerminalOutputForUi(chunkText, projectId, normalizedTerminalId, previewPublicBaseUrl)
       if (uiChunkText.trim()) {
         emitTerminalEvent(project, session, 'terminal:output', {
           projectId,
@@ -9514,7 +9542,7 @@ io.on('connection', (socket) => {
         for (const port of detectedPorts) merged.add(port)
         session.previewPortCandidates = Array.from(merged)
       }
-      const uiChunkText = sanitizeTerminalOutputForUi(chunkText, projectId, normalizedTerminalId)
+      const uiChunkText = sanitizeTerminalOutputForUi(chunkText, projectId, normalizedTerminalId, previewPublicBaseUrl)
       if (uiChunkText.trim()) {
         emitTerminalEvent(project, session, 'terminal:output', {
           projectId,
