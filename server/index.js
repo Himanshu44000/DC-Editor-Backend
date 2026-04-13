@@ -9275,8 +9275,18 @@ io.on('connection', (socket) => {
     }
 
     const normalizedCommand = normalizeInstallCommandForDevDeps(trimmedCommand)
-    const commandForExecution = isLikelyDevServerCommand(normalizedCommand) && session.assignedDevPort
-      ? buildDevServerCommandForPort(normalizedCommand, session.cwd, session.assignedDevPort)
+    const isDevServerCommand = isLikelyDevServerCommand(normalizedCommand)
+    let assignedDevPort = null
+
+    if (isDevServerCommand) {
+      assignedDevPort = Number(session.assignedDevPort || 0) || allocateDevServerPort()
+      if (assignedDevPort) {
+        session.assignedDevPort = assignedDevPort
+      }
+    }
+
+    const commandForExecution = isDevServerCommand && assignedDevPort
+      ? buildDevServerCommandForPort(normalizedCommand, session.cwd, assignedDevPort)
       : normalizedCommand
     const commandForShell = buildShellCommandForCwd(commandForExecution, session.cwd, session.shellProfile)
     const shell = getShellForCommand(commandForShell, session.shellProfile)
@@ -9296,18 +9306,17 @@ io.on('connection', (socket) => {
       delete childEnv.YARN_PRODUCTION
     }
 
-    if (isLikelyDevServerCommand(normalizedCommand)) {
+    if (isDevServerCommand) {
       childEnv.NODE_ENV = 'development'
-      const assignedPort = Number(session.assignedDevPort || 0) || allocateDevServerPort()
-      if (assignedPort) {
-        session.assignedDevPort = assignedPort
-        childEnv.PORT = String(assignedPort)
+      delete childEnv.NODE_OPTIONS
+      if (assignedDevPort) {
+        childEnv.PORT = String(assignedDevPort)
         childEnv.HOST = '0.0.0.0'
-        childEnv.VITE_PORT = String(assignedPort)
+        childEnv.VITE_PORT = String(assignedDevPort)
         childEnv.VITE_HOST = '0.0.0.0'
-        childEnv.NEXT_PORT = String(assignedPort)
+        childEnv.NEXT_PORT = String(assignedDevPort)
         const mergedCandidates = new Set(Array.isArray(session.previewPortCandidates) ? session.previewPortCandidates : [])
-        mergedCandidates.add(assignedPort)
+        mergedCandidates.add(assignedDevPort)
         session.previewPortCandidates = Array.from(mergedCandidates)
       }
     }
