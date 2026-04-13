@@ -7142,84 +7142,108 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
   }
 
   if (!session) {
-    return res.status(404).json({ message: 'No active preview server found for this terminal.' })
+    return res.status(404).json({ message: 'Terminal session not found. Start your dev server in the terminal.' })
+  }
+
+  // Get the detected preview port - this is set when we detect "Local: http://localhost:PORT" in terminal output
+  const previewPort = session.previewPort
+  if (!previewPort) {
+    return res.status(503).json({
+      message: 'Dev server not detected yet. Run npm run dev in terminal and wait for the "Local:" message to appear.',
+      debug: {
+        sessionExists: Boolean(session),
+        hasOutputBuffer: Boolean(session.outputBuffer),
+        outputSample: session.outputBuffer ? session.outputBuffer.substring(0, 200) : null,
+      },
+    })
   }
 
   const normalizedPath = String(requestedPath || '').replace(/^\/+/, '')
-  if (!session.previewPort || !normalizedPath) {
-    const resolvedPort = await resolveReachablePreviewPort(session)
-    if (resolvedPort) {
-      session.previewPort = resolvedPort
-    } else if (!normalizedPath) {
-      const fallbackCandidates = collectSessionPreviewPortCandidates(session)
-      if (fallbackCandidates.length) {
-        session.previewPort = fallbackCandidates[0]
-      } else {
-        return res.status(404).json({
-          message: 'No active frontend preview detected. Run npm run dev inside the project terminal and wait for the Local URL.',
-        })
-      }
-    }
-  }
-
-  if (!session.previewPort) {
-    return res.status(404).json({ message: 'No active preview server found for this terminal.' })
-  }
-
-  const candidatePorts = collectSessionPreviewPortCandidates(session)
+  const base = `http://127.0.0.1:${previewPort}`
+  const targetUrl = new URL(normalizedPath ? `/${normalizedPath}` : '/', base)
   const originalUrl = String(req.originalUrl || '')
   const queryIndex = originalUrl.indexOf('?')
-  let lastProxyError = null
-
-  for (const candidatePort of candidatePorts) {
-    const base = `http://127.0.0.1:${candidatePort}`
-    const targetUrl = new URL(normalizedPath ? `/${normalizedPath}` : '/', base)
-    if (queryIndex >= 0) {
-      targetUrl.search = originalUrl.slice(queryIndex)
-    }
-
-    try {
-      const upstream = await fetch(targetUrl, {
-        method: 'GET',
-        headers: {
-          Accept: String(req.headers.accept || '*/*'),
-          'User-Agent': String(req.headers['user-agent'] || 'dc-editor-preview-proxy'),
-        },
-        redirect: 'manual',
-      })
-
-      const payload = Buffer.from(await upstream.arrayBuffer())
-      const contentType = String(upstream.headers.get('content-type') || '')
-      const payloadText = normalizedPath ? '' : payload.toString('utf8')
-
-      if (!normalizedPath) {
-        const acceptable = shouldAcceptPreviewResponse(upstream.status, contentType, payloadText)
-        const clearlyWrong = looksLikeCannotGetRoot(payloadText)
-        if (!acceptable || clearlyWrong) {
-          continue
-        }
-      }
-
-      session.previewPort = candidatePort
-      for (const [headerName, headerValue] of upstream.headers.entries()) {
-        const normalizedHeader = String(headerName || '').toLowerCase()
-        if (normalizedHeader === 'connection') continue
-        if (normalizedHeader === 'transfer-encoding') continue
-        if (normalizedHeader === 'content-encoding') continue
-        res.setHeader(headerName, headerValue)
-      }
-
-      return res.status(upstream.status).send(payload)
-    } catch (proxyError) {
-      lastProxyError = proxyError
-      continue
-    }
+  if (queryIndex >= 0) {
+    targetUrl.search = originalUrl.slice(queryIndex)
   }
 
-  return res.status(502).json({
-    message: 'Preview server is not reachable. Start your app again in terminal and retry.',
-    details: String(lastProxyError?.message || 'no_matching_preview_server'),
-  })
+  try {
+    // Fetch with timeout to prevent hanging
+    const controller = new AbortController()
+    const timeoutHandle = setTimeout(() => controller.abort(), 8000) // 8 second timeout
+
+    const upstream = await fetch(String(targetUrl), {
+      method: 'GET',
+      headers: {
+        Accept: String(req.headers.accept || '*/*'),
+        'User-Agent': String(req.headers['user-agent'] || 'dc-editor-preview-proxy'),
+      },
+      redirect: 'manual',
+      signal: controller.signal,
+    })
+
+    clearTimeout(timeoutHandle)
+
+    // For root path, validate it looks like a frontend
+    if (!normalizedPath) {
+      const text = await upstream.text()
+      const contentType = String(upstream.headers.get('content-type') || '')
+      const acceptable = shouldAcceptPreviewResponse(upstream.status, contentType, text)
+      
+      if (!acceptable) {
+        console.error(`[Preview] Invalid response from ${targetUrl}: status=${upstream.status}, type=${contentType.substring(0, 50)}`)
+        return res.status(502).json({
+          message: 'Dev server returned invalid response. Ensure your app is running properly.',
+          debug: {
+            port: previewPort,
+            status: upstream.status,
+            contentType: contentType.substring(0, 100),
+          },
+        })
+      }
+
+      // It's valid, send it back
+      res.setHeader('Content-Type', contentType || 'text/html; charset=utf-8')
+      return res.status(upstream.status).send(text)
+    }
+
+    // For non-root paths, proxy the response directly
+    const payload = Buffer.from(await upstream.arrayBuffer())
+    const contentType = String(upstream.headers.get('content-type') || '')
+
+    for (const [headerName, headerValue] of upstream.headers.entries()) {
+      const normalizedHeader = String(headerName || '').toLowerCase()
+      if (normalizedHeader === 'connection') continue
+      if (normalizedHeader === 'transfer-encoding') continue
+      if (normalizedHeader === 'content-encoding') continue
+      res.setHeader(headerName, headerValue)
+    }
+
+    return res.status(upstream.status).send(payload)
+  } catch (error) {
+    const errorMessage = String(error?.message || error || '')
+    const errorCode = String(error?.code || '')
+
+    console.error(`[Preview Proxy Error] ${errorMessage} (${errorCode}) for port ${previewPort}`)
+    console.error(`[Preview] Attempted URL: ${targetUrl}`)
+    console.error(`[Preview] Session info:`, {
+      hasChild: Boolean(session.child),
+      childKilled: session.child?.killed,
+      outputBufferLength: session.outputBuffer?.length,
+    })
+
+    // Return detailed error for debugging
+    return res.status(503).json({
+      message: 'Unable to connect to dev server. Make sure npm run dev is running.',
+      details: errorMessage,
+      debug: {
+        port: previewPort,
+        error_code: errorCode,
+        target: String(targetUrl),
+        path: normalizedPath,
+      },
+    })
+  }
 }
 
 app.get('/api/projects/:projectId/terminal-preview/:terminalId', optionalAuthMiddleware, async (req, res) => {
@@ -9146,6 +9170,15 @@ io.on('connection', (socket) => {
       if (detectedPort) {
         session.previewPort = detectedPort
         session.previewUrl = `http://localhost:${detectedPort}`
+        // Emit preview-ready event with exact proxy URL
+        const proxyUrl = `/api/projects/${projectId}/terminal-preview/${normalizedTerminalId}/`
+        emitTerminalEvent(project, session, 'terminal:preview-ready', {
+          projectId,
+          terminalId: normalizedTerminalId,
+          previewUrl: proxyUrl,
+          devServerPort: detectedPort,
+          message: `Preview is ready at port ${detectedPort}`,
+        })
       }
       const detectedPorts = detectLocalPreviewPorts(`${session.outputBuffer}\n${chunkText}`)
       if (detectedPorts.length) {
@@ -9168,6 +9201,15 @@ io.on('connection', (socket) => {
       if (detectedPort) {
         session.previewPort = detectedPort
         session.previewUrl = `http://localhost:${detectedPort}`
+        // Emit preview-ready event with exact proxy URL
+        const proxyUrl = `/api/projects/${projectId}/terminal-preview/${normalizedTerminalId}/`
+        emitTerminalEvent(project, session, 'terminal:preview-ready', {
+          projectId,
+          terminalId: normalizedTerminalId,
+          previewUrl: proxyUrl,
+          devServerPort: detectedPort,
+          message: `Preview is ready at port ${detectedPort}`,
+        })
       }
       const detectedPorts = detectLocalPreviewPorts(`${session.outputBuffer}\n${chunkText}`)
       if (detectedPorts.length) {
