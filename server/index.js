@@ -3197,66 +3197,6 @@ const collectPreviewBaseCandidates = (session, port) => {
   return candidates
 }
 
-const buildPreviewLoadingHtml = (projectId, terminalId) => {
-  const refreshPath = `/api/projects/${encodeURIComponent(String(projectId || ''))}/terminal-preview/${encodeURIComponent(String(terminalId || ''))}/`
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Preparing Preview...</title>
-  <style>
-    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background:#0b1020; color:#e6ecff; margin:0; }
-    .wrap { min-height:100vh; display:grid; place-items:center; padding:24px; }
-    .card { width:min(680px, 92vw); background:#111832; border:1px solid #25305e; border-radius:14px; padding:22px; }
-    .title { font-size:20px; font-weight:700; margin:0 0 8px; }
-    .muted { color:#a9b6ea; margin:0 0 12px; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color:#9bd0ff; word-break:break-all; }
-  </style>
-  <meta http-equiv="refresh" content="2" />
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <p class="title">Preview server is compiling...</p>
-      <p class="muted">This is normal for first load (especially Next.js). This page auto-refreshes every 2 seconds.</p>
-      <p class="mono">${refreshPath}</p>
-    </div>
-  </div>
-</body>
-</html>`
-}
-
-const buildPreviewRetryHtml = (projectId, terminalId) => {
-  const refreshPath = `/api/projects/${encodeURIComponent(String(projectId || ''))}/terminal-preview/${encodeURIComponent(String(terminalId || ''))}/`
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Preview Loading</title>
-  <style>
-    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background:#0b1020; color:#e6ecff; margin:0; }
-    .wrap { min-height:100vh; display:grid; place-items:center; padding:24px; }
-    .card { width:min(680px, 92vw); background:#111832; border:1px solid #25305e; border-radius:14px; padding:22px; }
-    .title { font-size:20px; font-weight:700; margin:0 0 8px; }
-    .muted { color:#a9b6ea; margin:0 0 12px; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color:#9bd0ff; word-break:break-all; }
-  </style>
-  <meta http-equiv="refresh" content="2" />
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <p class="title">Preview is starting</p>
-      <p class="muted">The dev server is still compiling. This page auto-refreshes every 2 seconds until the app is ready.</p>
-      <p class="mono">${refreshPath}</p>
-    </div>
-  </div>
-</body>
-</html>`
-}
-
 const getProjectTerminalWorkspace = (projectId, userId) => {
   const key = `${String(projectId || '')}:${String(userId || '')}`
   const digest = createHash('sha1').update(key).digest('hex').slice(0, 16)
@@ -7459,10 +7399,6 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
   const normalizedPath = String(requestedPath || '').replace(/^\/+/, '')
   const targetBases = collectPreviewBaseCandidates(session, previewPort)
   if (!targetBases.length) {
-    if (!normalizedPath) {
-      return res.status(200).send(buildPreviewRetryHtml(projectId, terminalId))
-    }
-
     return res.status(503).json({
       message: 'No preview target could be resolved for this session.',
       debug: { port: previewPort },
@@ -7565,10 +7501,6 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
     childKilled: session.child?.killed,
     outputBufferLength: session.outputBuffer?.length,
   })
-
-  if (!normalizedPath) {
-    return res.status(200).send(buildPreviewRetryHtml(projectId, terminalId))
-  }
 
   return res.status(503).json({
     message: 'Unable to connect to dev server. Make sure npm run dev is running.',
