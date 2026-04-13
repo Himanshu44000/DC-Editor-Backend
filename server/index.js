@@ -3944,6 +3944,24 @@ const resolvePublicTerminalPreviewSession = (project, terminalId = 'terminal-1')
   return { session: preferred || candidates[0], normalizedTerminalId }
 }
 
+const resolveAnyActivePreviewSessionForProject = (project) => {
+  if (!project?.id) return null
+
+  const candidates = Array.from(terminalSessions.values()).filter((session) => {
+    if (!session) return false
+    if (session.projectId !== project.id) return false
+    if (session.previewPort) return true
+    if (Array.isArray(session.previewPortCandidates) && session.previewPortCandidates.length) return true
+    if (session.assignedDevPort) return true
+    return Boolean(session.child && !session.child.killed)
+  })
+
+  if (!candidates.length) return null
+
+  const running = candidates.find((session) => session.child && !session.child.killed)
+  return running || candidates[0]
+}
+
 const serializeProjectForDb = (project) => ({
   id: project.id,
   name: project.name,
@@ -7388,16 +7406,39 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
     }
     project = access.project
     session = resolveTerminalPreviewSession(project, req.userId, terminalId).session
-  } else if (allowPublicTerminalPreview) {
+  } else {
     project = projects.get(projectId)
     if (!project) {
       return res.status(404).json({ message: 'Project not found' })
     }
-    session = resolvePublicTerminalPreviewSession(project, terminalId).session
+
+    // Prefer configured behavior, but always allow fallback lookup for emitted preview links.
+    if (allowPublicTerminalPreview) {
+      session = resolvePublicTerminalPreviewSession(project, terminalId).session
+    }
+
+    if (!session) {
+      session = resolvePublicTerminalPreviewSession(project, terminalId).session
+    }
+  }
+
+  if (!project) {
+    project = projects.get(projectId) || null
+  }
+
+  if (!session && project) {
+    session = resolveAnyActivePreviewSessionForProject(project)
   }
 
   if (!session) {
-    return res.status(404).json({ message: 'Terminal session not found. Start your dev server in the terminal.' })
+    return res.status(404).json({
+      message: 'Terminal session not found. Start your dev server in the terminal.',
+      debug: {
+        projectId,
+        terminalId: String(terminalId || ''),
+        activeSessionCount: Array.from(terminalSessions.values()).filter((entry) => entry?.projectId === projectId).length,
+      },
+    })
   }
 
   // Get the detected preview port - this is set when we detect "Local: http://localhost:PORT" in terminal output
