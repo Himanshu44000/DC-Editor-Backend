@@ -3107,17 +3107,26 @@ const rewritePreviewAssetTextForProxy = (assetText, projectId, terminalId) => {
   return rewritten
 }
 
-const sanitizeTerminalOutputForUi = (text = '') => {
-  const normalized = String(text || '').replace(/http:\/\/0\.0\.0\.0:(\d{2,5})/gi, 'http://localhost:$1')
+const sanitizeTerminalOutputForUi = (text = '', projectId = '', terminalId = '') => {
+  const proxyBasePath = projectId && terminalId
+    ? `/api/projects/${encodeURIComponent(String(projectId || ''))}/terminal-preview/${encodeURIComponent(String(terminalId || ''))}/`
+    : ''
+
+  let normalized = String(text || '').replace(/http:\/\/0\.0\.0\.0:(\d{2,5})/gi, 'http://localhost:$1')
+  if (proxyBasePath) {
+    normalized = normalized.replace(/https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|::1):(\d{2,5})\/?/gi, proxyBasePath)
+  }
+
   const lines = normalized.split(/\r?\n/)
   const filtered = lines.filter((line) => {
     const value = String(line || '')
     if (!value.trim()) return true
-    if (/non-standard\s+"?node_env"?/i.test(value)) return false
+    if (/non-standard[\s\S]*node_env/i.test(value)) return false
     if (/nextjs\.org\/docs\/messages\/non-standard-node-env/i.test(value)) return false
     if (/we detected typescript in your project and reconfigured your tsconfig\.json file/i.test(value)) return false
     if (/the following suggested values were added to your tsconfig\.json/i.test(value)) return false
-    if (/include was updated to add '\.next\/dev\/dev\/types\/\*\*\/\*\.ts'/i.test(value)) return false
+    if (/include\s+was\s+updated\s+to\s+add\s+'.next\/dev\/dev\/types\/\*\*\/\*\.ts'/i.test(value)) return false
+    if (/project'?s\s+needs:/i.test(value)) return false
     return true
   })
   return filtered.join('\n')
@@ -3152,10 +3161,41 @@ const collectPreviewBaseCandidates = (session, port) => {
 
   pushBase('localhost')
   pushBase('127.0.0.1')
-  pushBase('::1')
-  pushBase('0.0.0.0')
+
+  // Avoid non-routable/fragile candidates in containerized environments.
+  // 0.0.0.0 is a bind address (not a destination), and ::1 may not be bound.
 
   return candidates
+}
+
+const buildPreviewLoadingHtml = (projectId, terminalId) => {
+  const refreshPath = `/api/projects/${encodeURIComponent(String(projectId || ''))}/terminal-preview/${encodeURIComponent(String(terminalId || ''))}/`
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Preparing Preview...</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background:#0b1020; color:#e6ecff; margin:0; }
+    .wrap { min-height:100vh; display:grid; place-items:center; padding:24px; }
+    .card { width:min(680px, 92vw); background:#111832; border:1px solid #25305e; border-radius:14px; padding:22px; }
+    .title { font-size:20px; font-weight:700; margin:0 0 8px; }
+    .muted { color:#a9b6ea; margin:0 0 12px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color:#9bd0ff; word-break:break-all; }
+  </style>
+  <meta http-equiv="refresh" content="2" />
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <p class="title">Preview server is compiling...</p>
+      <p class="muted">This is normal for first load (especially Next.js). This page auto-refreshes every 2 seconds.</p>
+      <p class="mono">${refreshPath}</p>
+    </div>
+  </div>
+</body>
+</html>`
 }
 
 const getProjectTerminalWorkspace = (projectId, userId) => {
@@ -7340,7 +7380,7 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         const controller = new AbortController()
-        const timeoutMs = normalizedPath ? 15000 : 45000
+        const timeoutMs = normalizedPath ? 10000 : 20000
         const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs)
 
         const upstream = await fetch(String(targetUrl), {
@@ -7421,6 +7461,10 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
     childKilled: session.child?.killed,
     outputBufferLength: session.outputBuffer?.length,
   })
+
+  if (!normalizedPath) {
+    return res.status(200).send(buildPreviewLoadingHtml(projectId, terminalId))
+  }
 
   return res.status(503).json({
     message: 'Unable to connect to dev server. Make sure npm run dev is running.',
@@ -9395,7 +9439,7 @@ io.on('connection', (socket) => {
         for (const port of detectedPorts) merged.add(port)
         session.previewPortCandidates = Array.from(merged)
       }
-      const uiChunkText = sanitizeTerminalOutputForUi(chunkText)
+      const uiChunkText = sanitizeTerminalOutputForUi(chunkText, projectId, normalizedTerminalId)
       if (uiChunkText.trim()) {
         emitTerminalEvent(project, session, 'terminal:output', {
           projectId,
@@ -9429,7 +9473,7 @@ io.on('connection', (socket) => {
         for (const port of detectedPorts) merged.add(port)
         session.previewPortCandidates = Array.from(merged)
       }
-      const uiChunkText = sanitizeTerminalOutputForUi(chunkText)
+      const uiChunkText = sanitizeTerminalOutputForUi(chunkText, projectId, normalizedTerminalId)
       if (uiChunkText.trim()) {
         emitTerminalEvent(project, session, 'terminal:output', {
           projectId,
