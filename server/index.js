@@ -3058,6 +3058,41 @@ const shouldAcceptPreviewResponse = (statusCode, contentType, bodyText = '') => 
   return false
 }
 
+const collectPreviewBaseCandidates = (session, port) => {
+  const numericPort = Number(port)
+  if (!Number.isInteger(numericPort) || numericPort < 1 || numericPort > 65535) return []
+
+  const candidates = []
+  const seen = new Set()
+
+  const pushBase = (host) => {
+    const normalizedHost = String(host || '').trim().toLowerCase()
+    if (!normalizedHost) return
+    if (seen.has(normalizedHost)) return
+    seen.add(normalizedHost)
+    if (normalizedHost === '::1') {
+      candidates.push(`http://[::1]:${numericPort}`)
+      return
+    }
+    candidates.push(`http://${normalizedHost}:${numericPort}`)
+  }
+
+  const fromOutput = String(session?.outputBuffer || '')
+  const matches = fromOutput.matchAll(/https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|::1):(\d{2,5})(?:[/?#][^\s]*)?/gi)
+  for (const match of matches) {
+    const host = String(match?.[1] || '').replace(/^\[(.*)\]$/, '$1')
+    const matchPort = Number(match?.[2])
+    if (matchPort === numericPort) pushBase(host)
+  }
+
+  pushBase('localhost')
+  pushBase('127.0.0.1')
+  pushBase('::1')
+  pushBase('0.0.0.0')
+
+  return candidates
+}
+
 const getProjectTerminalWorkspace = (projectId, userId) => {
   const key = `${String(projectId || '')}:${String(userId || '')}`
   const digest = createHash('sha1').update(key).digest('hex').slice(0, 16)
@@ -7159,91 +7194,98 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
   }
 
   const normalizedPath = String(requestedPath || '').replace(/^\/+/, '')
-  const base = `http://127.0.0.1:${previewPort}`
-  const targetUrl = new URL(normalizedPath ? `/${normalizedPath}` : '/', base)
+  const targetBases = collectPreviewBaseCandidates(session, previewPort)
+  if (!targetBases.length) {
+    return res.status(503).json({
+      message: 'No preview target could be resolved for this session.',
+      debug: { port: previewPort },
+    })
+  }
+
   const originalUrl = String(req.originalUrl || '')
   const queryIndex = originalUrl.indexOf('?')
-  if (queryIndex >= 0) {
-    targetUrl.search = originalUrl.slice(queryIndex)
-  }
+  let lastError = null
+  let lastTargetUrl = ''
 
-  try {
-    // Fetch with timeout to prevent hanging
-    const controller = new AbortController()
-    const timeoutHandle = setTimeout(() => controller.abort(), 8000) // 8 second timeout
+  for (const base of targetBases) {
+    const targetUrl = new URL(normalizedPath ? `/${normalizedPath}` : '/', base)
+    if (queryIndex >= 0) {
+      targetUrl.search = originalUrl.slice(queryIndex)
+    }
 
-    const upstream = await fetch(String(targetUrl), {
-      method: 'GET',
-      headers: {
-        Accept: String(req.headers.accept || '*/*'),
-        'User-Agent': String(req.headers['user-agent'] || 'dc-editor-preview-proxy'),
-      },
-      redirect: 'manual',
-      signal: controller.signal,
-    })
+    try {
+      const controller = new AbortController()
+      const timeoutHandle = setTimeout(() => controller.abort(), 8000)
 
-    clearTimeout(timeoutHandle)
+      const upstream = await fetch(String(targetUrl), {
+        method: 'GET',
+        headers: {
+          Accept: String(req.headers.accept || '*/*'),
+          'User-Agent': String(req.headers['user-agent'] || 'dc-editor-preview-proxy'),
+        },
+        redirect: 'manual',
+        signal: controller.signal,
+      })
 
-    // For root path, validate it looks like a frontend
-    if (!normalizedPath) {
-      const text = await upstream.text()
-      const contentType = String(upstream.headers.get('content-type') || '')
-      const acceptable = shouldAcceptPreviewResponse(upstream.status, contentType, text)
-      
-      if (!acceptable) {
-        console.error(`[Preview] Invalid response from ${targetUrl}: status=${upstream.status}, type=${contentType.substring(0, 50)}`)
-        return res.status(502).json({
-          message: 'Dev server returned invalid response. Ensure your app is running properly.',
-          debug: {
-            port: previewPort,
-            status: upstream.status,
-            contentType: contentType.substring(0, 100),
-          },
-        })
+      clearTimeout(timeoutHandle)
+
+      if (!normalizedPath) {
+        const text = await upstream.text()
+        const contentType = String(upstream.headers.get('content-type') || '')
+        const acceptable = shouldAcceptPreviewResponse(upstream.status, contentType, text)
+
+        if (!acceptable) {
+          lastError = new Error(`invalid_preview_response:${upstream.status}`)
+          lastTargetUrl = String(targetUrl)
+          continue
+        }
+
+        session.previewPort = previewPort
+        res.setHeader('Content-Type', contentType || 'text/html; charset=utf-8')
+        return res.status(upstream.status).send(text)
       }
 
-      // It's valid, send it back
-      res.setHeader('Content-Type', contentType || 'text/html; charset=utf-8')
-      return res.status(upstream.status).send(text)
+      const payload = Buffer.from(await upstream.arrayBuffer())
+      for (const [headerName, headerValue] of upstream.headers.entries()) {
+        const normalizedHeader = String(headerName || '').toLowerCase()
+        if (normalizedHeader === 'connection') continue
+        if (normalizedHeader === 'transfer-encoding') continue
+        if (normalizedHeader === 'content-encoding') continue
+        res.setHeader(headerName, headerValue)
+      }
+
+      session.previewPort = previewPort
+      return res.status(upstream.status).send(payload)
+    } catch (error) {
+      lastError = error
+      lastTargetUrl = String(targetUrl)
+      continue
     }
-
-    // For non-root paths, proxy the response directly
-    const payload = Buffer.from(await upstream.arrayBuffer())
-    const contentType = String(upstream.headers.get('content-type') || '')
-
-    for (const [headerName, headerValue] of upstream.headers.entries()) {
-      const normalizedHeader = String(headerName || '').toLowerCase()
-      if (normalizedHeader === 'connection') continue
-      if (normalizedHeader === 'transfer-encoding') continue
-      if (normalizedHeader === 'content-encoding') continue
-      res.setHeader(headerName, headerValue)
-    }
-
-    return res.status(upstream.status).send(payload)
-  } catch (error) {
-    const errorMessage = String(error?.message || error || '')
-    const errorCode = String(error?.code || '')
-
-    console.error(`[Preview Proxy Error] ${errorMessage} (${errorCode}) for port ${previewPort}`)
-    console.error(`[Preview] Attempted URL: ${targetUrl}`)
-    console.error(`[Preview] Session info:`, {
-      hasChild: Boolean(session.child),
-      childKilled: session.child?.killed,
-      outputBufferLength: session.outputBuffer?.length,
-    })
-
-    // Return detailed error for debugging
-    return res.status(503).json({
-      message: 'Unable to connect to dev server. Make sure npm run dev is running.',
-      details: errorMessage,
-      debug: {
-        port: previewPort,
-        error_code: errorCode,
-        target: String(targetUrl),
-        path: normalizedPath,
-      },
-    })
   }
+
+  const errorMessage = String(lastError?.message || 'no_matching_preview_server')
+  const errorCode = String(lastError?.code || '')
+
+  console.error(`[Preview Proxy Error] ${errorMessage} (${errorCode}) for port ${previewPort}`)
+  console.error(`[Preview] Last attempted URL: ${lastTargetUrl}`)
+  console.error('[Preview] Candidate bases:', targetBases)
+  console.error('[Preview] Session info:', {
+    hasChild: Boolean(session.child),
+    childKilled: session.child?.killed,
+    outputBufferLength: session.outputBuffer?.length,
+  })
+
+  return res.status(503).json({
+    message: 'Unable to connect to dev server. Make sure npm run dev is running.',
+    details: errorMessage,
+    debug: {
+      port: previewPort,
+      error_code: errorCode,
+      attempted_target: lastTargetUrl,
+      attempted_bases: targetBases,
+      path: normalizedPath,
+    },
+  })
 }
 
 app.get('/api/projects/:projectId/terminal-preview/:terminalId', optionalAuthMiddleware, async (req, res) => {
@@ -9126,7 +9168,9 @@ io.on('connection', (socket) => {
       if (assignedPort) {
         session.assignedDevPort = assignedPort
         childEnv.PORT = String(assignedPort)
+        childEnv.HOST = '0.0.0.0'
         childEnv.VITE_PORT = String(assignedPort)
+        childEnv.VITE_HOST = '0.0.0.0'
         childEnv.NEXT_PORT = String(assignedPort)
         const mergedCandidates = new Set(Array.isArray(session.previewPortCandidates) ? session.previewPortCandidates : [])
         mergedCandidates.add(assignedPort)
