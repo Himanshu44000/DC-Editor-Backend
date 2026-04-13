@@ -7413,15 +7413,28 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
       targetUrl.search = originalUrl.slice(queryIndex)
     }
 
-    const maxAttempts = normalizedPath ? 1 : 2
+    const maxAttempts = normalizedPath ? 1 : 1
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
-        const controller = new AbortController()
-        const timeoutMs = normalizedPath ? 15000 : 60000
-        const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs)
-
         let upstream
-        try {
+        if (normalizedPath) {
+          const controller = new AbortController()
+          const timeoutHandle = setTimeout(() => controller.abort(), 15000)
+          try {
+            upstream = await fetch(String(targetUrl), {
+              method: 'GET',
+              headers: {
+                Accept: String(req.headers.accept || '*/*'),
+                'User-Agent': String(req.headers['user-agent'] || 'dc-editor-preview-proxy'),
+              },
+              redirect: 'manual',
+              signal: controller.signal,
+            })
+          } finally {
+            clearTimeout(timeoutHandle)
+          }
+        } else {
+          // Do not abort root HTML fetch; Next first compile can exceed 60s on cold starts.
           upstream = await fetch(String(targetUrl), {
             method: 'GET',
             headers: {
@@ -7429,10 +7442,7 @@ const proxyTerminalPreviewRequest = async (req, res, projectId, terminalId, requ
               'User-Agent': String(req.headers['user-agent'] || 'dc-editor-preview-proxy'),
             },
             redirect: 'manual',
-            signal: controller.signal,
           })
-        } finally {
-          clearTimeout(timeoutHandle)
         }
 
         if (!normalizedPath) {
