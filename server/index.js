@@ -393,8 +393,10 @@ const TERMINAL_WORKSPACE_EPHEMERAL =
     .trim()
     .toLowerCase() === 'true'
 const LOCAL_STATE_PATH = path.join(process.cwd(), '.collab-state.json')
+const TERMINAL_SESSION_STATE_PATH = path.join(process.cwd(), '.collab-terminal-sessions.json')
 const LIVE_PREVIEW_SESSION_TTL_MS = 1000 * 60 * 60 * 6
 let dbClient = null
+let pendingTerminalSessionPersistTimer = null
 
 const scheduleProjectPersist = (projectId, delayMs = PROJECT_PERSIST_DEBOUNCE_MS) => {
   const normalizedProjectId = String(projectId || '').trim()
@@ -3996,6 +3998,89 @@ const loadLocalState = () => {
   }
 }
 
+const serializeTerminalSessionForState = (session) => ({
+  projectId: session.projectId,
+  terminalId: session.terminalId,
+  ownerUserId: session.ownerUserId,
+  workspaceDir: session.workspaceDir,
+  cwd: session.cwd,
+  shellProfile: session.shellProfile,
+  previewPort: session.previewPort || null,
+  previewPortCandidates: Array.isArray(session.previewPortCandidates) ? session.previewPortCandidates : [],
+  assignedDevPort: session.assignedDevPort || null,
+  outputBuffer: String(session.outputBuffer || '').slice(-16000),
+  command: String(session.command || ''),
+  createdAt: session.createdAt || null,
+  updatedAt: session.updatedAt || null,
+})
+
+const persistTerminalSessionState = () => {
+  const payload = {
+    sessions: Array.from(terminalSessions.values())
+      .filter((session) => session?.projectId && session?.terminalId && session?.ownerUserId && session?.workspaceDir)
+      .map((session) => serializeTerminalSessionForState(session)),
+  }
+
+  fs.writeFileSync(TERMINAL_SESSION_STATE_PATH, JSON.stringify(payload, null, 2), 'utf8')
+}
+
+const scheduleTerminalSessionPersist = (delayMs = 150) => {
+  if (pendingTerminalSessionPersistTimer) {
+    clearTimeout(pendingTerminalSessionPersistTimer)
+  }
+
+  pendingTerminalSessionPersistTimer = setTimeout(() => {
+    pendingTerminalSessionPersistTimer = null
+    try {
+      persistTerminalSessionState()
+    } catch (error) {
+      console.error('Failed to persist terminal sessions:', error.message)
+    }
+  }, Math.max(0, Number(delayMs) || 150))
+}
+
+const loadTerminalSessionState = () => {
+  if (!fs.existsSync(TERMINAL_SESSION_STATE_PATH)) return
+
+  try {
+    const raw = fs.readFileSync(TERMINAL_SESSION_STATE_PATH, 'utf8')
+    if (!raw.trim()) return
+    const parsed = JSON.parse(raw)
+    const records = Array.isArray(parsed?.sessions) ? parsed.sessions : []
+
+    for (const record of records) {
+      const projectId = String(record?.projectId || '').trim()
+      const terminalId = String(record?.terminalId || '').trim()
+      const ownerUserId = String(record?.ownerUserId || '').trim()
+      const workspaceDir = String(record?.workspaceDir || '').trim()
+      if (!projectId || !terminalId || !ownerUserId || !workspaceDir) continue
+      if (!projects.has(projectId)) continue
+
+      const sessionKey = terminalSessionKey(ownerUserId, projectId, terminalId)
+      terminalSessions.set(sessionKey, {
+        projectId,
+        terminalId,
+        ownerUserId,
+        workspaceDir,
+        cwd: String(record?.cwd || workspaceDir),
+        shellProfile: normalizeShellProfile(record?.shellProfile || 'default'),
+        child: null,
+        previewPort: Number(record?.previewPort || record?.assignedDevPort || 0) || null,
+        previewPortCandidates: Array.isArray(record?.previewPortCandidates)
+          ? record.previewPortCandidates.filter(Boolean)
+          : [],
+        assignedDevPort: Number(record?.assignedDevPort || 0) || null,
+        outputBuffer: String(record?.outputBuffer || '').slice(-16000),
+        command: String(record?.command || ''),
+        createdAt: record?.createdAt || null,
+        updatedAt: record?.updatedAt || null,
+      })
+    }
+  } catch (error) {
+    console.error('Failed to load terminal sessions:', error.message)
+  }
+}
+
 const persistUser = async (user) => {
   if (!dbClient) {
     await persistLocalState()
@@ -6482,6 +6567,8 @@ const stopProjectTerminals = async (projectId) => {
     }
     terminalSessions.delete(key)
   }
+
+  scheduleTerminalSessionPersist(0)
 
   for (const workspaceDir of workspaceDirs) {
     cleanupWorkspaceDirIfUnused(workspaceDir)
@@ -9320,6 +9407,10 @@ io.on('connection', (socket) => {
       session.shellProfile = requestedShellProfile || 'default'
     }
 
+    session.command = normalizedCommand
+    session.createdAt = session.createdAt || nowIso()
+    session.updatedAt = nowIso()
+
     if (!session.child || session.child.killed) {
       session.shellProfile = requestedShellProfile || session.shellProfile || 'default'
       session.previewPort = null
@@ -9371,6 +9462,7 @@ io.on('connection', (socket) => {
 
       session.cwd = nextPath
       terminalSessions.set(sessionKey, session)
+      scheduleTerminalSessionPersist()
       emitTerminalEvent(project, session, 'terminal:cwd', {
         projectId,
         terminalId: normalizedTerminalId,
@@ -9449,7 +9541,9 @@ io.on('connection', (socket) => {
 
     session.workspaceDir = workspaceDir
     session.child = child
+  session.updatedAt = nowIso()
     terminalSessions.set(sessionKey, session)
+  scheduleTerminalSessionPersist()
 
     emitTerminalEvent(project, session, 'terminal:started', {
       projectId,
@@ -9476,6 +9570,8 @@ io.on('connection', (socket) => {
       if (detectedPort) {
         session.previewPort = detectedPort
         session.previewUrl = `http://localhost:${detectedPort}`
+        session.updatedAt = nowIso()
+        scheduleTerminalSessionPersist()
         // Emit preview-ready event with exact proxy URL
         const proxyUrl = `/api/projects/${projectId}/terminal-preview/${normalizedTerminalId}/`
         emitTerminalEvent(project, session, 'terminal:preview-ready', {
@@ -9510,6 +9606,8 @@ io.on('connection', (socket) => {
       if (detectedPort) {
         session.previewPort = detectedPort
         session.previewUrl = `http://localhost:${detectedPort}`
+        session.updatedAt = nowIso()
+        scheduleTerminalSessionPersist()
         // Emit preview-ready event with exact proxy URL
         const proxyUrl = `/api/projects/${projectId}/terminal-preview/${normalizedTerminalId}/`
         emitTerminalEvent(project, session, 'terminal:preview-ready', {
@@ -9540,6 +9638,8 @@ io.on('connection', (socket) => {
     child.on('error', (childError) => {
       const active = terminalSessions.get(sessionKey)
       if (active?.child === child) active.child = null
+      session.updatedAt = nowIso()
+      scheduleTerminalSessionPersist()
       emitTerminalEvent(project, session, 'terminal:error', {
         projectId,
         terminalId: normalizedTerminalId,
@@ -9550,6 +9650,7 @@ io.on('connection', (socket) => {
     child.on('close', (code, signal) => {
       const active = terminalSessions.get(sessionKey)
       if (active?.child === child) active.child = null
+      session.updatedAt = nowIso()
       try {
         syncProjectFilesFromWorkspace(project, session.workspaceDir)
         persistProject(project).catch(() => {})
@@ -9565,6 +9666,8 @@ io.on('connection', (socket) => {
       })
 
       cleanupWorkspaceDirIfUnused(session.workspaceDir, sessionKey)
+
+      scheduleTerminalSessionPersist()
 
       broadcastProjectSnapshot(projectId, project).catch(() => {})
     })
@@ -9637,6 +9740,7 @@ io.on('connection', (socket) => {
     }
 
     terminalSessions.set(sessionKey, session)
+    scheduleTerminalSessionPersist()
     const suggestions = getCdCompletionSuggestions(project, session, input)
     if (typeof ack === 'function') ack({ suggestions })
   })
@@ -9693,6 +9797,7 @@ io.on('connection', (socket) => {
       for (const fallbackSession of fallbackSessions) {
         await stopTerminalProcess(fallbackSession)
       }
+      scheduleTerminalSessionPersist(0)
       return
     }
     const stopped = await stopTerminalProcess(session)
@@ -9703,6 +9808,7 @@ io.on('connection', (socket) => {
         message: 'Failed to stop process in this terminal.',
       })
     }
+    scheduleTerminalSessionPersist(0)
   })
 
   socket.on('terminal:stop-all', async ({ projectId, terminalIds }) => {
@@ -9732,6 +9838,7 @@ io.on('connection', (socket) => {
     for (const session of targetSessions) {
       await stopTerminalProcess(session)
     }
+    scheduleTerminalSessionPersist(0)
   })
 
   // Interactive code execution with streaming I/O
@@ -9842,6 +9949,8 @@ io.on('connection', (socket) => {
         await handleProjectLeave(projectId)
       }
     }
+
+    scheduleTerminalSessionPersist(0)
   })
 })
 
@@ -9856,6 +9965,7 @@ const start = async () => {
     }
 
     await initDb()
+    loadTerminalSessionState()
     if (STARTUP_VERBOSE) {
       if (dbClient) {
         console.log('PostgreSQL persistence enabled')
