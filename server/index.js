@@ -3637,7 +3637,7 @@ const buildDevServerCommandForPort = (commandText, cwd, assignedPort) => {
 
   const framework = detectDevServerFramework(cwd)
   const extraArgs = framework === 'next'
-    ? ` -- --hostname 0.0.0.0 --port ${port} --webpack`
+    ? ` -- --hostname 0.0.0.0 --port ${port}`
     : ` -- --host 0.0.0.0 --port ${port}`
 
   if (/^(npm|pnpm|yarn|bun)\s+run\s+(dev|start|preview)(\s|$)/i.test(raw)) {
@@ -3645,7 +3645,7 @@ const buildDevServerCommandForPort = (commandText, cwd, assignedPort) => {
   }
 
   if (/^next\s+dev(\s|$)/i.test(raw)) {
-    return `${raw} --hostname 0.0.0.0 --port ${port} --webpack`
+    return `${raw} --hostname 0.0.0.0 --port ${port}`
   }
 
   if (/^vite(\s|$)/i.test(raw)) {
@@ -9411,6 +9411,8 @@ io.on('connection', (socket) => {
       ...process.env,
       FORCE_COLOR: '0',
       NPM_CONFIG_PACKAGE_LOCK: 'true',
+      NODE_OPTIONS: '--max-old-space-size=512',
+      NEXT_TELEMETRY_DISABLED: '1'
     }
     delete childEnv.PORT
 
